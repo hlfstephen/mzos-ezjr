@@ -1,0 +1,49 @@
+# far_exports.txt — 需要 far 桩的函数（跨 bank 调用）
+#
+# 只有**函数**才登记在这里。RAM 变量（$C000 起）不经过桩：它们的地址是绝对值，
+# 各 bank 独立链接时由 -g 注入，切换 bank 不影响。ROM 常量（字模）走 -g 固定地址。
+#
+# 格式：<函数名> [bank]      bank 可省略（从 banksym 查，查到的必须一致）
+# 由 tools/gen_farstub.py 读取；遗漏会让「链接 A」报未定义符号，不会静默出错。
+
+# ---- bank1（常驻，但可切 bank 的代码调用它时要先切回 bank1）----
+fat_dir_heal     1
+fat_find_sav_lfn 1
+fat_full_lfn     1
+fat_info         1
+fat_mount        1
+rtc_read         1
+sav_ident        1
+
+# ---- bank2：fatw（FAT 写路径）----
+# 注意：fat_mkdir / fat_find_dir 不在这里 —— v0.16.13 起它们只在 fatw.c 内部
+# 被调用（SAVER 的构建与查找），而 "SAVER" 那 11 个字节是 bank2 的 _CODE 常量，
+# 跨 bank 传出去就会指向别的 bank 的字节。见 tools/verify_bankptr.py。
+fat_build_cmd    2
+fat_cluster_lba  2
+fat_open_read    2
+fat_open_sav     2
+fat_read_sec     2
+fat_sav_lfn      2
+fat_write_sec    2
+
+# ---- bank3：save（存档链）----
+save_auto_get    3
+save_auto_set    3
+save_boot        3
+save_last_dir    3
+save_last_full   3
+save_last_lfn    3
+save_prepare     3
+diag_last_record 3        # 自检屏读存档记录（bank4 → bank3）
+
+# ---- bank2：fatw 的内部函数（fatx 通过 extern 直接调，头文件里是宏名）----
+fatw_alloc       2
+fatw_dir_seek    2
+fatw_free_chain  2
+fatw_lfn_sum     2
+fatw_put         2
+fatw_slot        2
+
+# ---- bank4：debug 常设（只在 --diag 版编进去）----
+diag_screen      4

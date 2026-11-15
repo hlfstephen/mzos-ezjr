@@ -373,13 +373,18 @@ static uint8_t last_state(const char *name)
 }
 
 /* PSRAM -> .SAV */
-static uint8_t save_dump(uint8_t banks, const char *name, const uint16_t *lfn)
+static uint8_t save_dump(uint8_t banks, const char *sav_id, const uint16_t *lfn)
 {
     FatFile f;
     uint32_t size = (uint32_t)banks << 13;
     uint8_t err, p, i;
 
-    err = fat_open_sav(&f, name, size, lfn);
+    /* sav_id 是调用方算好的 "S1A2B3C4.SAV"（见 savkey.c）。
+     * ★ 这里**绝对不能**再调 sav_ident：fat_open_sav() 会把 g_lfn_buf 里那份
+     *   ROM 长名**就地**改成「….sav」（sav_lfn 的 in-place 模式），算第二次就
+     *   变成对「….sav」求哈希，和写进去时的名字不同 —— 长名 ROM 上表现为
+     *   「备份失败 / 校验失败」，纯 8.3 的 ROM 反而正常（它没有长名项）。*/
+    err = fat_open_sav(&f, sav_id, size, lfn);
     if (err)
         return err;
 
@@ -396,6 +401,45 @@ static uint8_t save_dump(uint8_t banks, const char *name, const uint16_t *lfn)
     return FAT_OK;
 }
 
+/* 读档时按**长名**认下来的那条 .SAV 的 8.3 短名（"SLZ2~1.SAV" 之类），以及它的
+ * 字节数。
+ *
+ * 为什么记它：卡上那条档的短名可能是别的系统现生成的，跟 sav_ident() 的哈希名
+ * 不是一回事。备份要写回这同一个文件 —— 否则卡上会出现两条长名完全相同、短名
+ * 不同的 .sav，玩家分不清，改也落在另一条上。
+ *
+ * ★ v0.16.6：定义搬到 fatn.c（常驻段）。本文件已编进 bank3，而常驻的 fatn.c 要
+ * 引用这两个变量 —— RAM 变量必须由主链接分配。*/
+extern char     g_sav_adopt[13];
+extern uint32_t g_sav_size;
+
+/* 按「本游戏的 .sav」这个判据打开一个档 —— **写后的回读校验**与**下次开机读档**
+ * 共用这一个入口，判据就不可能再分裂。
+ *
+ * 有长名（中文 / 长名 ROM）：**只认长名**，短名是什么一概不看。
+ *   理由见 save_load 里那段 —— 短名是 FAT 的兼容层，各家写法不同，不该当身份。
+ * 没有长名（纯 8.3 的英文 ROM，卡上根本没有 LFN 项）：短名是唯一身份，
+ *   先哈希名，再 v0.15.1 之前那份 GBK 截断名。
+ *
+ * lfn 不是 const：fat_find_sav_lfn 会把它就地改成「….sav」。这个转换是**幂等**的
+ * （取最后一个点、只换扩展名），重复调不会越改越短，所以调用点不必关心进来的是
+ * ROM 名还是已经是 .sav。*/
+static uint8_t sav_open(const char *name, uint16_t *lfn, FatFile *f, uint32_t *size)
+{
+    char id[13];
+
+    if (lfn) {
+        if (fat_find_sav_lfn(f) != FAT_OK)
+            return FAT_ERR_NO_FS;
+        *size = g_sav_size;
+        return FAT_OK;
+    }
+    sav_ident(name, 0, id);
+    if (fat_open_read(f, id, size) == FAT_OK)
+        return FAT_OK;
+    return fat_open_read(f, name, size);
+}
+
 /* 回读校验：把刚写出去的 .SAV 再读一遍，逐扇区与 PSRAM 比对。
  *
  * 为什么值得多花这一遍（64 次读，不到一秒）：v0.3.0 的窗口 bug 就是把根目录
@@ -403,13 +447,16 @@ static uint8_t save_dump(uint8_t banks, const char *name, const uint16_t *lfn)
  * 读档才发现没了。有了校验，"存坏了"能当场看见，而不是等下一次启动。
  *
  * 依赖 sd_read 读的是卡上的真实内容（写完已经等过约 11ms 的编程时间）。*/
-static uint8_t save_verify(uint8_t banks, const char *name)
+static uint8_t save_verify(uint8_t banks, const char *name, uint16_t *lfn)
 {
     FatFile f;
     uint32_t size = 0, want = (uint32_t)banks << 13;
     uint8_t p, i, k;
 
-    if (fat_open_read(&f, name, &size) != FAT_OK || size != want)
+    /* ★ 用与读档完全相同的判据（sav_open）。早先这里按哈希短名读、而读档按长名
+     * 认 —— 两边一旦分家，「长名没写进去」这种情况校验会照样通过，屏幕报「完成」，
+     * 下次开机却读不到档。用同一个入口，写坏当场就能看见。*/
+    if (sav_open(name, lfn, &f, &size) != FAT_OK || size != want)
         return FAT_ERR_VERIFY;
 
     for (p = 0; p < banks; p++) {
@@ -433,16 +480,36 @@ static uint8_t save_verify(uint8_t banks, const char *name)
 /* .SAV -> PSRAM。
  * wipe = 1 表示"卡上没有本游戏的存档，且 PSRAM 里是别的游戏留下的"，
  * 这时清成 $FF；wipe = 0 而卡上也没有存档，就**原样保留** PSRAM ——
- * 芯片里的存档靠纽扣电池活着，误清一次就没了。*/
-static void save_load(const char *name, uint8_t banks, uint8_t wipe)
+ * 芯片里的存档靠纽扣电池活着，误清一次就没了。
+ *
+ * ★ lfn 不是 const：fat_find_sav_lfn 会把它就地改成「….sav」（省掉一份 96 字节
+ * 暂存，_DATA 只剩几十字节）。这个转换是幂等的，调用点不必关心进来的已经是
+ * .sav 形式还是 ROM 原名。*/
+static void save_load(const char *name, uint8_t banks, uint8_t wipe,
+                      uint16_t *lfn)
 {
     FatFile f;
     uint32_t size = 0, want = (uint32_t)banks << 13;
     uint8_t p, i, have;
 
-    /* 官方内核会给带时钟的卡额外追加 48 字节（时钟 + 启动戳）。我们暂时不生成
-     * 也不使用，大小对得上或正好多 48 就取前 want 字节。 */
-    have = (fat_open_read(&f, name, &size) == FAT_OK) &&
+    g_sav_adopt[0] = 0;
+
+    /* ★ v0.16.12：读档**只认长名**（判据统一在 sav_open 里）。
+     *
+     * 存档的身份就一个事实：卡上有条「和 ROM 同名、只换扩展名」的 .sav。至于它
+     * 的 8.3 短名是什么 —— 本内核算的哈希名 `S1A2B3C4.SAV` 也好，别的系统按创建
+     * 顺序生成的 `SLZ2~1.SAV` 也好 —— 一律不看。三条理由：
+     *   1. 短名是 FAT 的兼容层，各家写法不同，本来就不该拿来当身份；
+     *   2. 只看短名时，从电脑拷回来的档认不出（v0.16.5 之前的老问题）；
+     *   3. 两套判据并存时「哪一档先命中」决定读的是哪份档。卡上要是同时躺着
+     *      两份同名档，行为就取决于目录顺序 —— 这不是玩家能预期的东西。
+     *
+     * 代价：每次启动多扫一遍 SAVER 目录。SD 读次数与按 8.3 名查一样（都是逐扇区
+     * 扫到命中），多出来的只是几百字节 LFN 项的解析。
+     *
+     * 纯 8.3 的英文 ROM（`TETRIS.GB`）卡上没有 LFN 项，没有长名可用 —— 那一支由
+     * sav_open 退回按短名查，见它的注释。*/
+    have = (sav_open(name, lfn, &f, &size) == FAT_OK) &&
            (size == want || size == want + SAVE_FOOTER);
 
     if (!have && !wipe)
@@ -463,7 +530,7 @@ static void save_load(const char *name, uint8_t banks, uint8_t wipe)
 
 uint8_t save_prepare(const GameEntry *g)
 {
-    uint8_t banks, last;
+    uint8_t banks, last, lfn_n;
 
     sd_read(fat_cluster_lba(g->cluster), game_work);
     banks = save_banks_of(game_work[0x149]);
@@ -474,7 +541,13 @@ uint8_t save_prepare(const GameEntry *g)
          * 卡上没有就清成 $FF（等于新卡带该有的样子）。留着衰减后的垃圾，游戏
          * 会提示存档损坏，个别游戏（水晶）甚至会卡在读档界面。*/
         if (batt_dry) last = 2;
-        save_load(g->name, banks, (uint8_t)(last == 2));
+        /* ★ 读侧也必须按长名定位，否则「写的」和「读的」是两个名字。
+         * fat_cwd 此刻正是这个 ROM 所在的目录：扫一遍目录取完整长名。
+         * 查不到（纯 8.3 ROM / 文件刚被删）传 0，sav_ident 自动退回 8.3 名。
+         * 这一次扫描是启动路径上新增的唯一 I/O，比原来多几十毫秒。*/
+        lfn_n = fat_full_lfn(fat_cwd, g->name, g_lfn_buf);
+        save_load(g->name, banks, (uint8_t)(last == 2),
+                  lfn_n ? g_lfn_buf : (uint16_t *)0);
     }
     /* ★ 记「上次运行的是谁」与卡带有没有存档 RAM 无关，必须在 if 外面。
      * 见 save_arm() 里的说明。*/
@@ -619,10 +692,32 @@ void save_boot(void)
      * 玩家却找不到文件。boot_full 为空（记录无效）才退回 boot_name。*/
     {
         const char *sav_nm = boot_full[0] ? boot_full : boot_name;
+        const uint16_t *lfn = lfn_n ? (const uint16_t *)g_lfn_buf : (const uint16_t *)0;
+        const char *use;
+        char sav_id[13];
 
-        err = save_dump(banks, sav_nm, lfn_n ? g_lfn_buf : (uint16_t *)0);
+        /* ★ 名字只算一次，而且必须在 save_dump 之前：fat_open_sav() 会把
+         * g_lfn_buf 就地改成「….sav」，之后再算就是对另一个名字求哈希了。*/
+        sav_ident(sav_nm, lfn, sav_id);
+
+        /* ★ 卡上若已有一条「长名相同」的 .sav（从电脑拷回来的那条，短名是系统
+         * 按新名字生成的），就写回它 —— 否则会多出一条长名一模一样、短名不同的
+         * 档。读档现在只认长名，两条同名档谁先被扫到就读谁，那就不可控了。
+         *
+         * ★ 要在这里现认一次，不能靠 g_sav_adopt：备份发生在**下次开机**，
+         * 而 g_sav_adopt 是 RAM 里的，断电就没了。现认的代价是再扫一遍 SAVER
+         * （十几个目录项，几毫秒），每次开机一次。*/
+        use = sav_id;
+        if (lfn) {
+            FatFile probe;
+
+            if (fat_find_sav_lfn(&probe) == FAT_OK && g_sav_adopt[0])
+                use = g_sav_adopt;
+        }
+
+        err = save_dump(banks, use, lfn);
         if (!err)
-            err = save_verify(banks, sav_nm);
+            err = save_verify(banks, sav_nm, lfn_n ? g_lfn_buf : (uint16_t *)0);
     }
 
     fat_cwd = 0;                        /* 备份完要回根目录继续扫列表 */

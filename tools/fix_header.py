@@ -7,8 +7,7 @@ fix_header.py — 填 GB ROM 头并计算校验和（替代缺失的 rgbfix）�
 把 $0104-$014F 的 cart header 填好：
   - $0104-$0133 Nintendo logo（标准 48 字节，GB 兼容所必需）
   - $0134-$0143 title "EZJRMINIKERNEL"
-  - $0147 cart type 0x00 (ROM only, 32KB)
-  - $0148 ROM size 0x00 (32KB)
+  - $0147/$0148 cart type / ROM size（32KB 写 ROM ONLY，>32KB 写 MBC5 + 容量）
   - $0149 RAM size 0x00
   - $014D header checksum
   - $014E-$014F global checksum
@@ -31,7 +30,9 @@ CGB_FLAG = 0x00             # DMG 兼容（真机 FPGA 只给 DMG 模式）
 
 
 def fix(data: bytearray) -> bytearray:
-    assert len(data) == 0x8000, f"ROM 应为 32KB，实际 {len(data)}"
+    n = len(data)
+    assert n in (0x8000, 0x10000, 0x20000, 0x40000), f"ROM 应为 32/64/128/256KB，实际 {n}"
+    banks = n // 0x4000
     # logo
     data[0x0104:0x0134] = NINTENDO_LOGO
     # title 区（$0134-$0143）先清零再填
@@ -40,8 +41,17 @@ def fix(data: bytearray) -> bytearray:
     data[0x0143] = CGB_FLAG
     data[0x0144:0x0146] = b"\x00\x00"   # new licensee
     data[0x0146] = 0x00                 # SGB flag
-    data[0x0147] = 0x00                 # cart type: ROM ONLY
-    data[0x0148] = 0x00                 # ROM size: 32KB
+    # cart type / ROM size：>32KB 写 MBC5 + 对应容量，这是 64KB ROM 的规范编码，
+    # 也是 PyBoy 之类模拟器选对 mapper 的依据。真机侧 stage1 按**文件大小**加载、
+    # 不读这两个字段（上游 docs/kernel-size.md 明说，官方 160KB 内核 $0148 仍是
+    # 0x00），所以写规范值只为模拟器，不影响真机加载。
+    if banks > 2:
+        data[0x0147] = 0x19             # MBC5
+        data[0x0148] = {4: 0x01, 8: 0x02, 16: 0x03}.get(banks, 0x00)
+        assert data[0x0148], f"{banks} bank 的 ROM size 编码没定义"
+    else:
+        data[0x0147] = 0x00             # ROM ONLY
+        data[0x0148] = 0x00             # 32KB
     data[0x0149] = 0x00                 # RAM size: none
     data[0x014A] = 0x00                 # destination: Japan
     data[0x014B] = 0x33                 # old licensee
@@ -63,7 +73,7 @@ def fix(data: bytearray) -> bytearray:
 
 
 def verify(data: bytes) -> bool:
-    if len(data) != 0x8000:
+    if len(data) not in (0x8000, 0x10000, 0x20000, 0x40000):
         print(f"  大小错误: {len(data)}"); return False
     if data[0x0104:0x0134] != NINTENDO_LOGO:
         print("  Nintendo logo 不符"); return False
@@ -78,7 +88,7 @@ def verify(data: bytes) -> bool:
         g = (g + data[a]) & 0xFFFF
     if g != ((data[0x014E] << 8) | data[0x014F]):
         print(f"  global checksum 不符: 算得 {g:04X}"); return False
-    print(f"  OK: 32KB, logo 正确, header chk={chk:02X}, global chk={g:04X}")
+    print(f"  OK: {len(data)//1024}KB, logo 正确, header chk={chk:02X}, global chk={g:04X}")
     print(f"  title={data[0x0134:0x0142].decode('ascii','replace').rstrip(chr(0))} "
           f"type={data[0x0147]:02X} rom={data[0x0148]:02X}")
     return True

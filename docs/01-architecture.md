@@ -1,8 +1,12 @@
 # 架构：从 KB 到屏幕
 
-本内核是一个 **32 KB、单 bank、ROM-only（cart type `0x00`）** 的 Game Boy 程序。
-EZ-Flash 的 stage1 / 工厂引导把它当作普通 ROM 加载进执行槽，从 `$0100` 进入——
-所以它不需要任何 MBC 逻辑，也不做运行时的 bank 切换。
+本内核是一个 **128 KB、8 bank、MBC5（cart type `0x19`）** 的 Game Boy 程序。
+EZ-Flash 的 stage1 / 工厂引导按**文件大小**把它整个加载进 PSRAM（bank N 在文件偏移
+N × `$4000`），从 `$0100` 进入。`$2000` 是 8 位 bank 锁存（与上游官方内核用的是
+同一处写），所以能映射 256 个 bank（上游 mod 版内核就是 256 KB / 16 bank）。
+
+v0.16.6 起按功能组分 bank（[12-bank-layout.md](12-bank-layout.md)）：常驻段互相 call
+是直达，跨 bank 调用经过 bank0 里的桩（`src/farcall.s`），代价约 40 周期。
 
 ---
 
@@ -25,25 +29,36 @@ $0150  init:
 
 ## 2. 段布局
 
-32 KB ROM 在 GB 上是**两块固定映射的 16 KB**：`$0000-$3FFF` 与 `$4000-$7FFF`。
-本内核把「读/显示/UI」放在第一块，「写路径/存档/启动」放在第二块 —— 这只是**链接期
-分区**（`sdcc --codeseg BANK1`），运行时不切 bank，也不需要 trampoline。
+GB 的 ROM 窗口是 `$0000-$3FFF`（bank0，永远固定）与 `$4000-$7FFF`（可切换）。
+物理 bank N 落在文件偏移 N × `$4000`，所以 128 KB 的 `ezgb.dat` 是 8 个抽屉：
+
+| bank | 地址 | 内容 | 怎么进 |
+|---|---|---|---|
+| 0 | `$0000-$3FFF` | `crt0` / `_HOME` / **far 桩表（`$0400` 起）** / `main` / `video` / `fnt` / `fpga` | 永远可见 |
+| 1 | `$4000-$7FFF` | `fat` / `fatn` / `fatx` / `game` / `savkey` / `rtc` / `launch.s` | 默认映射，零成本 |
+| 2 | 同上窗口 | `fatw`（簇链、目录项写入、簇/扇区读写） | 桩切 bank |
+| 3 | 同上窗口 | `save`（存档链） | 桩切 bank |
+| 4 | 同上窗口 | **debug 常设**：`--diag` 的自检屏 | 桩切 bank |
+| 5 | 同上窗口 | 字模（`--constseg BANKFONT`，1536 字节） | `video.c` 切 bank |
+| 6-7 | 同上窗口 | 空（`$FF`），留给新功能 | — |
 
 | 段 | 地址 | 内容 |
 |---|---|---|
 | `_HEADER` | `$0000-$014F` | 中断向量、Nintendo logo、GB 头 |
 | `_HOME` | `$0150-$0380` | `init`、`gsinit`（必须 < `$0400`） |
-| `_INITIALIZER` / `_GSINIT` / `_GSFINAL` | `$0380-$03A5` | C 全局变量初值 |
-| `_CODE` | `$0400-$3D3A` | `main.c` / `video.c` / `fat.c` / `fatn.c` / `rtc.c` / `game.c` / `fpga.c` / 字库数据 |
-| `_BANK1` | `$4000-$7F69` | `save.c` / `fatw.c` / `fatx.c` / `launch.s` |
-| `_DATA` / `_BSS` | `$C000-` | 全局变量（`games[64]`、扇区缓存、长名缓冲），3750 / 3840 字节 |
+| `_INITIALIZER` / `_GSINIT` / `_GSFINAL` | `$0380-$03BB` | C 全局变量初值 + 可切 bank 静态变量清零 + `_far_cur` 初始化 |
+| `_CODE` | `$0400-$284D` | 桩表 + `main` / `video` / `fnt` / `fpga` + C 库 |
+| `_BANK1` | `$4000-$6F6F` | `fat` / `fatn` / `fatx` / `game` / `savkey` / `rtc` / `launch.s` |
+| `_DATA` | `$C000-` | 全局变量（`games[64]`、扇区缓存、长名缓冲），3754 / 3840 字节 |
+| 可切 bank 的静态变量 | `$D100` / `$D300` / `$D500` | 每 bank 512 字节，由 crt0 在 gsinit 里清零 |
 
 > `_CODE` 从 `$0400` 起而不是 `$0200`：给 `_HOME` + `_GSINIT` 留足空间，避免加功能后
-> 撞上代码段。
+> 撞上代码段。桩表固定排在最前（紧跟 crt0），这样各 bank 单独链接时桩地址是常数
+> `$0400 + i × 7`，不用等主链接算出来。
 
-**两段都贴边了**：正式版 `_CODE` 余 710、`_BANK1` 余 151 字节；`--diag` 版 `_CODE` 余 68、
-`_BANK1` 余 7 字节。再要加功能只能
-做多 bank（stage1 按文件大小加载整个 `ezgb.dat`，`$2000` 是 8 位 bank 锁存）。
+**余量**（v0.16.6 实测）：`_CODE` 余 6067、`_BANK1` 余 4241、bank2 余约 7.7 K、
+bank3 余约 12.7 K、bank5 余约 14.3 K。v0.16.5 时这两段分别只剩 603 与 **-17**
+（正式版直接链接失败）。
 
 `_DATA` 顶端必须避开 `$D000` 起的 handoff 区（`launch.s` 复制到那里执行），`build.sh`
 会检查。

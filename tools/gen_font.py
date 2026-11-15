@@ -42,6 +42,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FONT_NAME = "fusion-pixel-8px-monospaced-zh_hans.ttf"
 DEFAULT_FONT = os.environ.get("EZJR_FONT") or os.path.join(HERE, "..", "vendor", FONT_NAME)
 OUT_H = os.path.join(ROOT, "src", "font_data.h")
+OUT_C = os.path.join(ROOT, "src", "font_data.c")
 OUT_STR = os.path.join(ROOT, "src", "strings.h")
 OUT_DOC = os.path.join(ROOT, "docs", "cjk-glyphs.md")
 
@@ -235,6 +236,8 @@ def main():
     L.append("#ifndef FONT_DATA_H")
     L.append("#define FONT_DATA_H")
     L.append("")
+    L.append("#include <stdint.h>")
+    L.append("")
     L.append("/* tilemap 里的 tile 编号约定：")
     L.append(" *   $00       空白（清屏/擦除用）")
     L.append(" *   $01-$0B  界面符号，见 cjk_symbols[]，C 里用 \"\\x01\" 引用")
@@ -259,34 +262,53 @@ def main():
     L.append(" * video.c 上传时把 low/high 两半写成同一个字节，像素值就是颜色 3 —— ")
     L.append(" * 这样 ROM 只占一半，上传也就一个循环。*/")
     L.append("")
-    L.append("static const unsigned char cjk_symbols[SYM_COUNT][8] = {")
-    for i, (ident, ch, note) in enumerate(UI_SYMBOLS):
-        L.append("    {%s},  /* 0x%02X %s %s */"
-                 % (hexrow(render_tile(font, ch)), i + 1, ident, note))
-    L.append("};")
-    L.append("")
-    L.append("static const unsigned char ascii_font[ASCII_COUNT][8] = {")
-    for c in range(0x20, 0x7F):
-        ch = chr(c)
-        show = {"\\": "backslash", "'": "quote", '"': "dquote"}.get(ch, ch)
-        L.append("    {%s},  /* 0x%02X '%s' */" % (hexrow(render_tile(font, ch)), c, show))
-    L.append("};")
-    L.append("")
-    L.append("/* 汉字：索引 = glyph id - 1，每个 8 字节 */")
-    L.append("static const unsigned char cjk_font[CJK_COUNT][8] = {")
-    for i, ch in enumerate(glyphs):
-        L.append("    {%s},  /* %2d %s */" % (hexrow(render_tile(font, ch)), i + 1, ch))
-    L.append("};")
-    L.append("")
-    L.append("/* 每个界面汉字的 Unicode 码点。渲染时按码点做缓存键 —— 这样界面汉字")
-    L.append(" * 和卡上中文文件名里的同一个字共用 VRAM 里一个 tile，不会各占一份。*/")
-    L.append("static const uint16_t cjk_cp[CJK_COUNT] = {")
-    for i, ch in enumerate(glyphs):
-        L.append("    0x%04X,  /* %2d %s */" % (ord(ch), i + 1, ch))
-    L.append("};")
+    # 定义搬进 font_data.c，.h 只留 extern：正式版要把数据单独编进扩展 bank，
+    # 而 static const 会让每个 include 它的编译单元各存一份、搬不走。
+    L.append("extern const unsigned char cjk_symbols[SYM_COUNT][8];")
+    L.append("extern const unsigned char ascii_font[ASCII_COUNT][8];")
+    L.append("extern const unsigned char cjk_font[CJK_COUNT][8];")
+    L.append("extern const uint16_t cjk_cp[CJK_COUNT];")
     L.append("")
     L.append("#endif /* FONT_DATA_H */")
     header = "\n".join(L) + "\n"
+
+    # ---- font_data.c ----
+    # 定义顺序必须与 build.sh 从 font.map 取符号的顺序一致。
+    C = ["/* 自动生成，请勿手改；由 tools/gen_font.py 生成。 */",
+         "/* 字模数据的定义与 video.c 分离，这样正式版能把它们单独编进扩展 bank",
+         " * （见 build.sh 的 --constseg BANK2 与 tools/join_banks.py）。",
+         " * 定义顺序（cjk_symbols -> ascii_font -> cjk_font -> cjk_cp）必须与",
+         " * build.sh 从 map 里取符号地址的顺序一致。*/",
+         "#include <stdint.h>",
+         '#include "font_data.h"',
+         ""]
+    C.append("const unsigned char cjk_symbols[SYM_COUNT][8] = {")
+    for i, (ident, ch, note) in enumerate(UI_SYMBOLS):
+        C.append("    {%s},  /* 0x%02X %s %s */"
+                 % (hexrow(render_tile(font, ch)), i + 1, ident, note))
+    C.append("};")
+    C.append("")
+    C.append("const unsigned char ascii_font[ASCII_COUNT][8] = {")
+    for c in range(0x20, 0x7F):
+        ch = chr(c)
+        show = {"\\": "backslash", "'": "quote", '"': "dquote"}.get(ch, ch)
+        C.append("    {%s},  /* 0x%02X '%s' */" % (hexrow(render_tile(font, ch)), c, show))
+    C.append("};")
+    C.append("")
+    C.append("/* 汉字：索引 = glyph id - 1，每个 8 字节 */")
+    C.append("const unsigned char cjk_font[CJK_COUNT][8] = {")
+    for i, ch in enumerate(glyphs):
+        C.append("    {%s},  /* %2d %s */" % (hexrow(render_tile(font, ch)), i + 1, ch))
+    C.append("};")
+    C.append("")
+    C.append("/* 每个界面汉字的 Unicode 码点。渲染时按码点做缓存键 —— 这样界面汉字")
+    C.append(" * 和卡上中文文件名里的同一个字共用 VRAM 里一个 tile，不会各占一份。*/")
+    C.append("const uint16_t cjk_cp[CJK_COUNT] = {")
+    for i, ch in enumerate(glyphs):
+        C.append("    0x%04X,  /* %2d %s */" % (ord(ch), i + 1, ch))
+    C.append("};")
+    C.append("")
+    src_c = "\n".join(C) + "\n"
 
     # ---- strings.h ----
     S = []
@@ -346,6 +368,7 @@ def main():
     doc_txt = "\n".join(D) + "\n"
 
     print("\n  font_data.h 预计 %d 字节" % len(header))
+    print("  font_data.c 预计 %d 字节" % len(src_c))
     print("  strings.h   预计 %d 字节" % len(ids_h))
 
     if args.check:
@@ -353,12 +376,13 @@ def main():
         return 0 if not bad else 1
 
     open(OUT_H, "w", encoding="utf-8").write(header)
+    open(OUT_C, "w", encoding="utf-8").write(src_c)
     open(OUT_STR, "w", encoding="utf-8").write(ids_h)
     open(OUT_DOC, "w", encoding="utf-8").write(doc_txt)
     old = os.path.join(ROOT, "src", "cjk_ids.h")
     if os.path.exists(old):
         os.remove(old)
-    print("\n已写出:\n  %s\n  %s\n  %s" % (OUT_H, OUT_STR, OUT_DOC))
+    print("\n已写出:\n  %s\n  %s\n  %s\n  %s" % (OUT_H, OUT_C, OUT_STR, OUT_DOC))
     return 0 if not bad else 1
 
 

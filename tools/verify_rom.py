@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 verify_rom.py — 静态校验构建出的 ezgb.dat：
-  - 32KB、GB 头与校验和（复用 fix_header.verify）
+  - ROM 大小、GB 头与校验和（复用 fix_header.verify）
   - $0100 入口是 nop + jp（匹配 crt0.s）
   - 代码段不与中断向量区（$0000-$0100）冲突
   - 中文/ASCII 字库数据确实烘进了 ROM（在 ROM 里能找到特征字节）
@@ -30,7 +30,8 @@ def main():
         if not cond: ok = False
 
     print("=== GB ROM 结构 ===")
-    chk("32KB", len(data) == 0x8000, f"{len(data)} bytes")
+    chk("ROM 大小", len(data) in (0x8000, 0x10000, 0x20000, 0x40000),
+        f"{len(data)//1024}KB ({len(data)//0x4000} banks)")
     print("  头字段:")
     if not header_verify(data): ok = False
     chk("$0100 = nop; jp", data[0x0100] == 0x00 and data[0x0101] == 0xC3,

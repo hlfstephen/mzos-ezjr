@@ -330,15 +330,17 @@ static void lfn_entry(uint8_t *e, uint8_t ord, uint8_t first,
     }
 }
 
-/* 从 (sidx, soff) 起写 nent 条 LFN + 1 条短名项 + 1 条 $00 终止符。
+/* 从 (sidx, soff) 起写 nent 条 LFN + 1 条短名项 + 1 条收尾空槽。
  *
  * 按扇区拆开写：起点离扇区尾只差一两槽时，长名项会跨到下一个扇区 —— 这在
  * FatFs 里是常态（它每次 move_window 只改 32 字节，窗口自己滚动），我们按
  * 扇区读写，就把同一扇区的那几项攒起来写一次。跨扇区不是异常，不用绕。
  *
- * 最后一项固定写 $00：目录终止符必须紧跟最后一个有效项，否则 Windows 从
- * $00 处截断，新写的项就成了「隐形项」。dir_alloc 要了 nent+2 个槽，其中
- * 最后那个槽就是留给它的。*/
+ * ★ 收尾槽**不再无条件写 $00**（v0.15.0 修）。它原本是 $00（真链尾）就保持
+ * $00，原本是 $E5（目录中间被删出来的空洞）就保持 $E5 —— 后一种情况写 $00
+ * 会把空洞**后面**的有效项全部截断，Windows 从此看不见它们，内核下一次
+ * dir_seek 也跟着看不见，于是「明明有档却查不到、再建一条」，同名项越备份
+ * 越多。dir_alloc 要的 nent+2 个槽里，最后那个就是留给这层保护的。*/
 /* dir_put 的两个 32 位入参走文件内全局。
  *
  * 8 个参数在 sm83 上要压 18 字节栈，而主机测试实测到 size 拿到的是**上一次**
@@ -377,6 +379,11 @@ static void dir_put(uint8_t nent, uint16_t sidx, uint16_t soff,
                 /* +$0C 的 bit4 = 「扩展名是小写」。短名本身仍存大写 "SAV"
                  * （FAT 规定），这一位只影响 Windows / Linux 的显示。*/
                 e[12] = 0x10;
+                /* WrtTime 00:00 已在 memset 里清零；WrtDate = 2015-01-01
+                 * ((2015-1980)<<9 | 1<<5 | 1 = 0x4621)。与官方内核一致。
+                 * 全 0 的日期在 Windows 里显示成 1601/1/1，部分工具视为无效。*/
+                e[24] = 0x21;
+                e[25] = 0x46;
                 e[20] = (uint8_t)(first >> 16);        /* 首簇高 16 位 */
                 e[21] = (uint8_t)(first >> 24);
                 e[26] = (uint8_t)first;                /* 首簇低 16 位 */
@@ -386,7 +393,9 @@ static void dir_put(uint8_t nent, uint16_t sidx, uint16_t soff,
                 e[30] = (uint8_t)(size >> 16);
                 e[31] = (uint8_t)(size >> 24);
             } else {
-                e[0] = 0x00;                           /* 目录终止符 */
+                /* 终止槽：链尾 $00 保持 $00，中间空洞 $E5 保持 $E5。
+                   一律写 $00 会截断后面的有效项（见本函数顶部注释）。*/
+                e[0] = (e[0] == 0x00) ? 0x00 : 0xE5;
             }
         }
         sd_write(lba, fbuf);
@@ -423,7 +432,7 @@ uint8_t fatw_slot(uint8_t nent, uint32_t *lba, uint16_t *off)
  *      文件名对不上，加载器就配不上对。
  *   2. 主体**不截断**，整段搬过来（缓冲 FAT_LFN_FULL 够宽）；只换末位扩展名。
  *      截断会让 .sav 比 ROM 短，同样导致「存档读不出来」。*/
-static uint8_t sav_lfn(const uint16_t *rom, uint16_t *out)
+uint8_t fat_sav_lfn(const uint16_t *rom, uint16_t *out)
 {
     uint8_t i, n = 0, dot = 0, o = 0;
 
@@ -563,6 +572,76 @@ uint32_t fat_find_dir(const uint8_t *raw11)
     return 0;
 }
 
+/* ---- 建子目录（从 fatx.c 搬来，v0.16.13）----
+ *
+ * 为什么搬：fatx.c 编在 bank0，从本文件（bank2）调它要过桩，而 saver11 是
+ * **bank2 的 _CODE 常量** —— 桩把 $4000 窗口换成 bank0 之后，fat_mkdir 收到的
+ * raw11 指向 bank0 的字节，写进目录项的名字是垃圾。真机上只在「卡上还没有
+ * SAVER 目录」时触发，所以 v0.12.5 以来一直没露头。
+ *
+ * 搬过来之后 fat_mkdir / fat_find_dir 都只在本 bank 里被调用，不再需要 far 桩
+ * （已从 tools/far_exports.txt 移除）；「SAVER 的 11 字节名」也就不会跨 bank
+ * 传递了。tools/verify_bankptr.py 会持续检查这一类问题。*/
+static void put_dir_entry(uint8_t *e, const uint8_t *raw11, uint8_t attr,
+                          uint32_t cluster)
+{
+    uint8_t i;
+
+    memset(e, 0, 32);
+    for (i = 0; i < 11; i++) e[i] = raw11[i];
+    e[11] = attr;
+    e[20] = (uint8_t)(cluster >> 16);
+    e[21] = (uint8_t)(cluster >> 24);
+    e[26] = (uint8_t)cluster;
+    e[27] = (uint8_t)(cluster >> 8);
+}
+
+/* 在**当前目录**（fat_cwd）下建一个子目录。已存在就返回它原来的簇号。
+ * 返回 0 = 失败（目录满 / 没有空簇），调用方自己决定要不要退而求其次。*/
+uint32_t fat_mkdir(const uint8_t *raw11)
+{
+    static const uint8_t dot[11]    = {'.',' ',' ',' ',' ',' ',' ',' ',' ',' ',' '};
+    static const uint8_t dotdot[11] = {'.','.',' ',' ',' ',' ',' ',' ',' ',' ',' '};
+    uint32_t lba = 0, c, parent;
+    uint16_t off = 0;
+    uint8_t  s;
+
+    if (!mount_ok)
+        return 0;
+
+    c = fat_find_dir(raw11);            /* 已经有了就直接用，别重复建 */
+    if (c)
+        return c;
+
+    if (!fatw_slot(1, &lba, &off))      /* 目录满，且扩不出新簇 */
+        return 0;
+
+    c = fat_alloc();
+    if (c == 0)
+        return 0;
+    fat_put(c, is_fat32 ? 0x0FFFFFFFUL : 0xFFFFUL);
+
+    /* 新簇必须先清零：里面残留的旧数据会被当成目录项读出来，
+     * 玩家就会在 SAVER 里看见一堆乱七八糟的文件名。*/
+    memset(fbuf, 0, 512);
+    for (s = 0; s < csize; s++)
+        sd_write(fat_cluster_lba(c) + s, fbuf);
+
+    /* "." 和 ".."。本内核自己不读它们（列表里的「..」是扫描时插的虚拟项，
+     * 不依赖这两个目录项），但电脑上的文件管理器会看，缺了会报目录损坏。*/
+    parent = fat_cwd ? fat_cwd : (is_fat32 ? root_cluster : 0);
+    sd_read(fat_cluster_lba(c), fbuf);
+    put_dir_entry(fbuf, dot, 0x10, c);
+    put_dir_entry(fbuf + 32, dotdot, 0x10, parent);
+    sd_write(fat_cluster_lba(c), fbuf);
+
+    /* 父目录里落下这一项 */
+    sd_read(lba, fbuf);
+    put_dir_entry(fbuf + off, raw11, 0x10, c);
+    sd_write(lba, fbuf);
+    return c;
+}
+
 /* SAVER 固定在**根目录**，全卡只此一个（v0.11.0 起跟官方目录约定一致）。
  * v0.10.0 按 ROM 所在目录各建一个，用户实测根目录已经有一个、子目录里又冒出
  * 第二个，反而乱。两个函数都临时把工作目录切到根，出口还原，这样不管 ROM
@@ -607,7 +686,7 @@ uint8_t fat_open_sav(FatFile *f, const char *rom_name, uint32_t size,
     /* 只在新建目录项时写长名。已有 .SAV（尤其是旧版留下的短名文件）保持
      * 原样不动 —— 「搬目录项」要删旧项写新项，中途断电会丢档，不值得。 */
     if (lfn && lfn[0]) {
-        slen = sav_lfn(lfn, sav);
+        slen = fat_sav_lfn(lfn, sav);
         nent = (uint8_t)((slen + 12) / 13);
         /* 一条 LFN 项装 13 字符，9 条够 117 字符（远超现实最长名）。上限只用来
          * 兜底，真正能不能写这么多条，还要看下面 dir_seek 找不找得到连续空槽。*/
@@ -626,6 +705,9 @@ uint8_t fat_open_sav(FatFile *f, const char *rom_name, uint32_t size,
      * 宁可让屏幕说「目录已满」，也不要把文件丢到没人会去看的地方。*/
     if (!sv) { rc = FAT_ERR_ADD_DIR; goto out; }
     fat_cwd = sv;
+    /* 修掉历史版本写进目录中间的错误 $00，让被截断的存档重新可见。
+       只把「后面还有有效项」的 $00 改成 $E5，正常目录零写入。*/
+    fat_dir_heal(sv);
 
     r = dir_seek(raw, &lba, &off);
     if (r == 1) {
@@ -664,9 +746,8 @@ uint8_t fat_open_sav(FatFile *f, const char *rom_name, uint32_t size,
     }
 
     /* ---- 找落点并把目录项写进去 ----
-     * 要 nent+2 个连续空槽：nent 条 LFN + 1 条短名 + 1 条终止符 $00。
-     * 结尾那个槽是必须的：没它，新写的项后面直接是链尾，Windows 读不到
-     * 「目录到此结束」，轻则显示多余项，重则整条目录被判成损坏。
+     * 要 nent+2 个连续空槽：nent 条 LFN + 1 条短名 + 1 条收尾空槽。
+     * 收尾槽由 dir_put 按原状态保留 $00/$E5，不再一律写成 $00。
      *
      * 凑不齐就扩一簇再找 —— 新簇全 $00，必然够。这条路径以前是「报目录满」，
      * 玩家只能手动删存档；而 SAVER 才十几个文件，根本不该满。*/
@@ -680,6 +761,11 @@ uint8_t fat_open_sav(FatFile *f, const char *rom_name, uint32_t size,
         fbuf[off + 26] = (uint8_t)first;
         fbuf[off + 27] = (uint8_t)(first >> 8);
         w32(fbuf, (uint16_t)(off + 28), size);
+        /* 旧版写的项时间戳全 0（1601/1/1），顺手补成 2015-01-01 */
+        if (!fbuf[off + 24] && !fbuf[off + 25]) {
+            fbuf[off + 24] = 0x21;
+            fbuf[off + 25] = 0x46;
+        }
         sd_write(lba, fbuf);
     } else {
         if (!dir_alloc((uint8_t)(nent + 2), &sidx, &soff)) {
@@ -717,7 +803,7 @@ uint8_t fat_open_read(FatFile *f, const char *rom_name, uint32_t *size)
 
     dir0 = fat_cwd;
     sv = saver_find();
-    if (sv) fat_cwd = sv;
+    if (sv) { fat_cwd = sv; fat_dir_heal(sv); }
 
     r = dir_seek(raw, &lba, &off);
     if (r != 1 && sv) {                 /* 老位置回落 */

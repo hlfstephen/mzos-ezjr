@@ -57,7 +57,7 @@ extern void save_boot_demo(void);
  * 固件 = 16 列，补丁号放得下；再长就到两位数补丁号，那时才需要缩。
  *
  * 后面的列位置由 VER_COL 自己算，改版本号不用再动绘制代码。*/
-#define MZOS_VER     "V0.14.0"
+#define MZOS_VER     "V0.16.15"
 #define VER_COL      (5 + ((uint8_t)(sizeof(MZOS_VER) - 1)) + 1)  /* "MZOS "+版本+空格 */
 
 #define TAB_GAME     0
@@ -455,8 +455,9 @@ static void launch_error(uint8_t err);
  * B 返回。
  *
  * 做成整屏而不是盖在列表上：20x18 的屏幕里，六行菜单压住半个列表，底下的
- * 名字缺一半反而看不清。整屏重绘也就一两帧。菜单反色（黑底白字）+ 左右边框
- * 拉满全屏，名字行用细线框和引导符号明确降级为子信息。上下切换只挪箭头。*/
+ * 名字缺一半反而看不清。整屏重绘也就一两帧。菜单跟列表同配色（白底黑字、
+ * 不反色），名字行只靠「比菜单项多缩进一个字符」降级为子信息，不加框线、
+ * 不加行首引导符号。上下切换只挪箭头。*/
 #if EZJR_DIAG
 #define MENU_N      3
 #define MENU_EXTRA  1

@@ -15,10 +15,6 @@
  * ★ RTC base（$A018-$A01C）留到 P1。P0 的目标是"先能进游戏"，把两个变量
  *   分开，真机上失败时才分得清是加载命令错还是 base 写错。
  */
-/* 启动诊断屏：把启动前算出来的东西摊在屏幕上停 3 秒（按 A 立刻走）。
- * 真机上 SD 和 FPGA 都测不到，装载失败时这一屏是唯一的一手数据。
- * 定位完就把它删掉或改成 0。*/
-#define EZJR_LAUNCH_DIAG 0
 
 #include <string.h>
 #include "hw.h"
@@ -97,64 +93,6 @@ static uint8_t header_sum(const uint8_t *h)
     return x;
 }
 
-#if EZJR_LAUNCH_DIAG && !defined(EZJR_HOST_TEST)
-/* 一屏读出：$7F32（kernel_mode，命令窗口的使能之一）、$7FC0、$7F36、
- * 文件大小/首簇、ROM 头三字节、算出的 MBC/掩码/校验和、段数、首段 LBA、
- * 以及命令表写进 $A000 后的回读结果（RD 1 = 窗口没映射，写丢了）。*/
-static void launch_diag(const GameEntry *g, uint8_t t, uint8_t rc, uint8_t ac,
-                        uint8_t mbc, uint16_t rmask, uint8_t ram, uint8_t chk,
-                        uint8_t segs, uint8_t rdbad)
-{
-    uint8_t i;
-    uint32_t lba = (uint32_t)game_work[4] | (uint32_t)game_work[5] << 8 |
-                   (uint32_t)game_work[6] << 16 | (uint32_t)game_work[7] << 24;
-
-    cjk_begin();
-    clear_screen();
-    cjk_center(0, STR_GAME);
-    print_at(2, 0, "MODE");
-    print_u16(2, 5, REG(0x7F32));
-    print_at(3, 0, "PG");
-    print_u16(3, 3, REG(0x7FC0));
-    print_at(3, 6, "LD");
-    print_u16(3, 9, REG(0x7F36));
-    print_at(4, 0, "SZ");
-    print_u32(4, 3, g->size);
-    print_at(5, 0, "CL");
-    print_u32(5, 3, g->cluster);
-    print_at(6, 0, "T");
-    print_dec2(6, 2, t);
-    print_at(6, 5, "R");
-    print_dec2(6, 7, rc);
-    print_at(6, 10, "A");
-    print_dec2(6, 12, ac);
-    print_at(7, 0, "MB");
-    print_dec2(7, 3, mbc);
-    print_at(7, 6, "RM");
-    print_u16(7, 9, rmask);
-    print_at(7, 14, "RR");
-    print_dec2(7, 17, ram);
-    print_at(8, 0, "CK");
-    print_dec2(8, 3, chk);
-    print_at(8, 6, "EX");
-    print_dec2(8, 9, segs);
-    print_at(9, 0, "LBA");
-    print_u32(9, 4, lba);
-    print_at(10, 0, "RD");
-    print_dec2(10, 3, rdbad);
-    print_at(17, 0, "A:GO AUTO 3S");
-    video_on();
-
-    for (i = 0; i < 180; i++) {                 /* 约 3 秒，按 A 立刻走 */
-        if (buttons() & BTN_A)
-            break;
-        wait_frames(1);
-    }
-    wait_release();
-    rLCDC = 0;
-}
-#endif
-
 #ifdef EZJR_HOST_TEST
 void host_cmd_window(const uint8_t *cmd);   /* 桩：见 tools/launch_host_test.py */
 #endif
@@ -228,28 +166,6 @@ uint8_t game_launch(const GameEntry *g)
 #else
 
     memcpy((void *)0xA000, game_work, 512);
-
-#if EZJR_LAUNCH_DIAG && !defined(EZJR_HOST_TEST)
-    {
-        uint8_t rdbad = 0, segs = 0;
-        uint16_t i;                     /* 扫到 $1E8，uint8_t 会回绕 */
-
-        /* 回读：窗口真的映射了才有命令。写丢时 pSRAM 页 2 里是旧值，
-         * FPGA 会拿着 0 去装载（等于从 LBA 0 读），现象是进游戏后
-         * logo 空白、代码跑飞。*/
-        for (i = 0; i < 8; i++)
-            if (WINDOW[i] != game_work[i]) rdbad = 1;
-        for (i = 0; i < 4; i++)
-            if (WINDOW[0x1F0 + i] != game_work[0x1F0 + i]) rdbad = 1;
-
-        for (i = 4; i < 0x1E8; i += 8) {
-            segs++;
-            if (game_work[i + 4] == 0xFF && game_work[i + 7] == 0xFF)
-                break;
-        }
-        launch_diag(g, t, rc, ac, mbc, rmask, ram, chk, segs, rdbad);
-    }
-#endif
 
     /* 以下两行之后，ROM 里就没有这个内核了 —— 顺序不能调换 */
     memcpy((void *)0xD000, launch_start,
