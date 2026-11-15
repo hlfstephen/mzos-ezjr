@@ -14,6 +14,11 @@
 #define REG(a) (*(volatile uint8_t *)(a))
 #endif
 
+/* $2000：kernel mode 下是 ROM bank 的 8 位锁存（见 docs/01-architecture.md）。
+ * 写 N 就把 bank N 映射到 $4000-$7FFF；bank0（$0000-$3FFF）永远固定。
+ * 与上游一致：官方内核也用这同一处写来切 bank（FarCallTrampoline）。*/
+#define ROM_BANK REG(0x2000)
+
 /* ---- GB 侧 ----
  * 主机侧测试（-DEZJR_HOST_TEST）把 LY/LCDC 换成普通变量：直接访问 $FF44
  * 在 Linux 上会段错误，而「等 VBlank 再关屏」这段逻辑值得单独验证。*/

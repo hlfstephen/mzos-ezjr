@@ -102,4 +102,22 @@ gsinit::
         dec     b
         jr      nz, 4$
         .area   _GSFINAL
+        ; ---- 可切 bank 的静态变量区（$D100-$D8FF）----
+        ; gsinit 上面只清/拷 _DATA（$C000 起，由主链接分配），而 bank2/3/4 的
+        ; static 变量落在各自的 $D1xx/$D3xx/$D5xx（见 build.sh 的 BANKRAM），
+        ; 不在 _DATA 范围内 —— 不清的话首次进入可切 bank 读到的是上电随机值。
+        ld      hl, #0xD100
+        ld      bc, #0x0800
+6$:     xor     a, a
+        ld      (hl+), a
+        dec     bc
+        ld      a, b
+        or      c
+        jr      nz, 6$
+        ; ---- far call 的当前 bank ----
+        ; 上面 init 已把 ROM_BANK 设成 1，这里让软件影子跟上；_far_sp 归零。
+        ld      a, #1
+        ld      (_far_cur), a
+        xor     a, a
+        ld      (_far_sp), a
         ret

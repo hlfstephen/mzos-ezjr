@@ -26,68 +26,20 @@ extern uint32_t fatw_alloc(void);
 extern void     fatw_put(uint32_t c, uint32_t v);
 extern void     fatw_free_chain(uint32_t c);
 extern uint8_t  fatw_lfn_sum(const uint8_t *raw11);
+/* fat.c 的簇号->扇区换算。fat.c 里已去掉 static；fatw.c 另有一份同名 static，
+ * 互不影响，所以这里不要放进 fat.h（会与 fatw.c 的 static 定义冲突）。*/
+extern uint32_t cluster_sector(uint32_t c);
+extern uint32_t froot_lba;
+extern uint16_t froot_sectors;
 
-/* 写一条目录项：名字、属性、首簇。大小恒 0（目录项就该是 0），
- * 时间日期也留 0 —— 卡上有 1980 年建的文件不奇怪，写一串假日期反而更怪。*/
-static void put_entry(uint8_t *e, const uint8_t *raw11, uint8_t attr,
-                      uint32_t cluster)
-{
-    uint8_t i;
+/* fat.c 里这两个是 static；dir_chain 搬过来后需要自己的一份（纯字节拼接）。*/
+static uint16_t ld16(const uint8_t *p) { return p[0] | (uint16_t)p[1] << 8; }
+static uint32_t ld32(const uint8_t *p) { return ld16(p) | (uint32_t)ld16(p + 2) << 16; }
 
-    memset(e, 0, 32);
-    for (i = 0; i < 11; i++) e[i] = raw11[i];
-    e[11] = attr;
-    e[20] = (uint8_t)(cluster >> 16);
-    e[21] = (uint8_t)(cluster >> 24);
-    e[26] = (uint8_t)cluster;
-    e[27] = (uint8_t)(cluster >> 8);
-}
-
-/* 在**当前目录**（fat_cwd）下建一个子目录。已存在就返回它原来的簇号。
- * 返回 0 = 失败（目录满 / 没有空簇），调用方自己决定要不要退而求其次。*/
-uint32_t fat_mkdir(const uint8_t *raw11)
-{
-    static const uint8_t dot[11]    = {'.',' ',' ',' ',' ',' ',' ',' ',' ',' ',' '};
-    static const uint8_t dotdot[11] = {'.','.',' ',' ',' ',' ',' ',' ',' ',' ',' '};
-    uint32_t lba = 0, c, parent;
-    uint16_t off = 0;
-    uint8_t  s;
-
-    if (!fmount_ok)
-        return 0;
-
-    c = fat_find_dir(raw11);            /* 已经有了就直接用，别重复建 */
-    if (c)
-        return c;
-
-    if (!fatw_slot(1, &lba, &off))      /* 目录满，且扩不出新簇 */
-        return 0;
-
-    c = fatw_alloc();
-    if (c == 0)
-        return 0;
-    fatw_put(c, fis_fat32 ? 0x0FFFFFFFUL : 0xFFFFUL);
-
-    /* 新簇必须先清零：里面残留的旧数据会被当成目录项读出来，
-     * 玩家就会在 SAVER 里看见一堆乱七八糟的文件名。*/
-    memset(fbuf, 0, 512);
-    for (s = 0; s < fcsize; s++)
-        sd_write(fat_cluster_lba(c) + s, fbuf);
-
-    /* "." 和 ".."。本内核自己不读它们（列表里的「..」是扫描时插的虚拟项，
-     * 不依赖这两个目录项），但电脑上的文件管理器会看，缺了会报目录损坏。*/
-    parent = fat_cwd ? fat_cwd : (fis_fat32 ? froot_cluster : 0);
-    sd_read(fat_cluster_lba(c), fbuf);
-    put_entry(fbuf, dot, 0x10, c);
-    put_entry(fbuf + 32, dotdot, 0x10, parent);
-    sd_write(fat_cluster_lba(c), fbuf);
-
-    /* 父目录里落下这一项 */
-    sd_read(lba, fbuf);
-    put_entry(fbuf + off, raw11, 0x10, c);
-    sd_write(lba, fbuf);
-    return c;
-}
+/* v0.16.13：fat_mkdir() 搬去 fatw.c（bank2）了 —— 从 bank2 调 bank0 的
+ * 目录创建要过桩，而调用方传的 "SAVER\\0\\0..." 是 bank2 的 _CODE 常量，
+ * 切 bank 之后指针指向 bank0 的字节，写进目录项的名字是垃圾。两个函数现在
+ * 都只在 fatw.c 内部用，不再需要 far 桩。put_entry() 也跟着搬走了。*/
 
 /* "POKEMON.GBC" -> 8.3 原始 11 字节 "POKEMON GBC"。
  * 名字里的非 ASCII 字节（中文名生成的 ~1 短名）原样抄过去，与目录项一致。*/
@@ -185,4 +137,120 @@ uint8_t fat_delete(const char *rom)
     if (first >= 2)
         fatw_free_chain(first);         /* 簇不回收，卡用几次就满了 */
     return FAT_OK;
+}
+
+/* ---- 目录自愈：修历史版本写进中间的错误 $00 ----
+ *
+ * v0.12.x 的 dir_put 在**每一次新建**后都无条件补一个 $00 终止符。若新项落在
+ * 目录中间的 $E5 空洞里，这个 $00 会把它后面的有效项全部截断：Windows 从
+ * $00 处停住，dir_seek 也在那里 return 2。表现是「卡上有档，却查不到，再建
+ * 一条」，同名 .sav 越攒越多。
+ *
+ * 修法：找出整个目录里**最后一个有效项**的位置，把它之前出现的所有 $00 改成
+ * $E5（已删除标记，Windows 会跳过继续读）。最后一个有效项之后的 $00 是真正的
+ * 链尾，保持不动。
+ *
+ * 只改 $00 → $E5，不删不改任何有效项，也不碰簇链 —— 中途断电最坏只是这次
+ * 没修完，下次开机再修，不会丢档。*/
+uint8_t fat_dir_heal(uint32_t dir)
+{
+    uint32_t chain[16], saved = fat_cwd;
+    uint8_t  secs, i, nfix = 0, last = 0xFF;
+    uint16_t k, last_off = 0, lim;
+
+    if (!fmount_ok) return 0;
+    fat_cwd = dir;
+    secs = dir_chain(dir, chain, 16);
+
+    /* 第一遍：记住整个目录最后一个有效项在哪个扇区、哪个偏移 */
+    for (i = 0; i < secs; i++) {
+        sd_read(chain[i], fbuf);
+        for (k = 0; k < 512; k += 32) {
+            if (fbuf[k] != 0x00 && fbuf[k] != 0xE5) {
+                last = i;
+                last_off = k;
+            }
+        }
+    }
+    if (last == 0xFF) { fat_cwd = saved; return 0; }
+
+    /* 第二遍：它之前的 $00 都是错的。同一扇区只扫到 last_off，
+       后面的真终止符不碰；更靠前的扇区整扇都算「之前」。*/
+    for (i = 0; i <= last && i < secs; i++) {
+        uint8_t dirty = 0;
+        lim = (i == last) ? last_off : 512;
+        sd_read(chain[i], fbuf);
+        for (k = 0; k < lim; k += 32) {
+            if (fbuf[k] == 0x00) {
+                fbuf[k] = 0xE5;
+                dirty = 1;
+                nfix++;
+            }
+        }
+        if (dirty) sd_write(chain[i], fbuf);
+    }
+    fat_cwd = saved;
+    return nfix;
+}
+
+/* ---- 簇链遍历（原在 fat.c 的 _BANK1 里，v0.15.0 移到 _CODE 腾出空间）----
+ * 它被 fat.c(BANK1) 和 fatn.c/fatx.c(_CODE) 多处调用，放 bank0 后 bank1 省约
+ * 150 字节。bank0 调 bank1 的 cluster_sector 是安全的：bank1 常驻 $4000。*/
+/* 展开簇链时的 FAT 扇区缓存。借用 fbuf 而不是自己再开 512 字节：
+ * _DATA 只剩不到 200 字节，再来一个静态 512 缓冲就顶到 $D000 handoff 区了。
+ * dir_chain() 运行期间 fbuf 只装 FAT 扇区，返回后调用者才开始读目录扇区，
+ * 两者不重叠，所以可以共用。*/
+static uint8_t  fchain_ok;
+static uint32_t fchain_lba;
+
+static uint32_t fat_next_fbuf(uint32_t c)
+{
+    uint32_t fs;
+    uint16_t off = fat_fat_offset(c, &fs);
+
+    if (!fchain_ok || fchain_lba != fs) {
+        sd_read(fs, fbuf);
+        fchain_lba = fs;
+        fchain_ok  = 1;
+    }
+    if (fis_fat32)
+        return ld32(fbuf + off) & 0x0FFFFFFFUL;
+    return ld16(fbuf + off);
+}
+
+/* 填目录扇区表。dir = 0 是根目录，否则是子目录首簇。
+ * 返回扇区个数（最多 cap）。FAT16 的根目录是紧跟 FAT 的一片连续扇区；
+ * 子目录和 FAT32 根目录都走簇链。
+ *
+ * cap 传 32：FAT16 根目录正好 32 扇区（512 个条目）；子目录在 4KB 簇时
+ * 32 扇区 = 4 簇 = 16KB 目录，也够 512 项。列表上限 64 条早就截断了。*/
+uint8_t dir_chain(uint32_t dir, uint32_t *chain, uint8_t cap)
+{
+    uint8_t  n = 0;
+    uint16_t i;
+    uint32_t c;
+
+    fchain_ok = 0;
+
+    if (dir == 0 && !fis_fat32) {
+        for (i = 0; i < froot_sectors && n < cap; i++)
+            chain[n++] = (uint32_t)(froot_lba + i);
+        return n;
+    }
+
+    c = (dir == 0) ? froot_cluster : dir;
+    /* ★ 链尾判据要按 FAT 类型分开写：FAT16 的 EOF 标记是 $FFF8-$FFFF，
+     * 而 $FFF8-$FFFF 全都小于 $0FFFFFF8 —— 只用 FAT32 那个门限，FAT16 上
+     * 链尾会被当成合法簇号继续走，把 cluster_sector(65535) 这种天文数字
+     * 当成 LBA 去读（真机上读回垃圾、主机测试里直接越界）。
+     * 以前只有根目录走 dir_chain（FAT16 走上面那个连续扇区分支），所以没露馅；
+     * v0.12.0 的 fat_full_lfn 第一次让子目录也走簇链，才踩到。*/
+    while (c >= 2 && c < (fis_fat32 ? 0x0FFFFFF8UL : 0xFFF8UL) && n < cap) {
+        uint32_t nxt = fat_next_fbuf(c);
+        for (i = 0; i < fcsize && n < cap; i++)
+            chain[n++] = cluster_sector(c) + i;
+        c = nxt;
+    }
+    fchain_ok = 0;                       /* fbuf 马上要被目录扇区覆盖 */
+    return n;
 }

@@ -147,6 +147,26 @@ def run_stock(r, shots=None):
     vr = sum(1 for a in range(0x8000, 0x9800) if py.memory[a])
     r.ck("VRAM 已有 tile 数据（符号+ASCII 已上传）", vr > 300, f"{vr} 非零字节")
 
+    # ---- 字模到底是从哪个 bank 读出来的 ----
+    # video.c 读字模前必须把 $2000 切到 bank5（EZJR_FONT_BANKED 控制）。这个宏
+    # 一旦漏定义，FONT_BANK_ENTER() 就成了空操作，读 $4000 拿到的是 bank1 的
+    # **代码字节**：屏幕满是小方块，程序不崩、不报错、ROM 里的字模数据也完全
+    # 正确，静态校验一条都抓不到。v0.16.6 真踩过一次，靠人工比对截图才发现。
+    # 判据：VRAM 里的 tile 有多少个能在 bank5 的字模区里精确匹配。
+    data = open(rom, "rb").read()
+    if len(data) >= 6 * 0x4000:
+        font = data[5 * 0x4000: 5 * 0x4000 + (11 + 95 + 86) * 8]
+        pats = {font[i:i + 8] for i in range(0, len(font) - 7, 8)}
+        pats = {p for p in pats if any(p)}
+        hit = 0
+        for t in range(256):
+            # vram_tile 把 1bpp 展开成 low=high=b，取偶数位就还原
+            v = bytes(py.memory[0x8000 + (t << 4) + (i << 1)] for i in range(8))
+            if any(v) and v in pats:
+                hit += 1
+        r.ck("字模来自 bank5（EZJR_FONT_BANKED 生效）", hit >= 10,
+             f"{hit} 个 tile 与字模逐字节一致")
+
     ji = row_raw(py, 6)
     cjk = sum(1 for t in ji if is_cjk(t))
     r.ck("第 6 行出现汉字 tile（「存储卡错误」5 字）", cjk >= 5, f"{cjk} 个")
@@ -521,10 +541,12 @@ def run_test_rom(r, shots=None):
     r.ck("文件名行不再加框（行 7 / 行 9 都没有框线）",
          row_raw(py, 7)[2] != 0x02 and row_raw(py, 9)[2] != 0x02,
          repr(row_text(py, 7)) + " / " + repr(row_text(py, 9)))
-    r.ck("文件名行是「空格─」引导（col2 空、col3 横线）+ 缩进到第 6 列",
-         row_raw(py, 8)[2] == 0 and row_raw(py, 8)[3] == 0x02
-         and row_raw(py, 8)[4] == 0 and row_raw(py, 8)[5] == 0
-         and (is_cjk(row_raw(py, 8)[6]) or 0x20 <= row_raw(py, 8)[6] <= 0x7E),
+    # v0.16.15：去掉行首「- 」引导符，名字只比菜单项（col 2）多缩进一个字符，
+    # 即从 col 3 起。这里同时守门「横线不许再回来」。
+    r.ck("文件名行无「- 」引导符，只比菜单项多缩进一个字符（col 3 起）",
+         row_raw(py, 8)[2] == 0
+         and (is_cjk(row_raw(py, 8)[3]) or 0x20 <= row_raw(py, 8)[3] <= 0x7E)
+         and all(t != 0x02 for t in row_raw(py, 8)[:6]),
          repr(row_text(py, 8)) + " " + repr(row_raw(py, 8)[:8]))
     if shots:
         save_shot(py, shots, "13-menu-dir.png")
@@ -701,8 +723,14 @@ def run_boot_screens(r, shots=None):
             r.ck("确认屏标题是「备份存档」",
                  sum(1 for t in row_raw(py, 5) if is_cjk(t)) == 4,
                  repr(rows[5]))
-            r.ck("确认屏显示中文全名（含开头的 K）",
+            r.ck("确认屏显示中文名（含开头的 K）",
                  "K" in rows[8] and sum(1 for t in row_raw(py, 8) if is_cjk(t)) >= 4,
+                 repr(rows[8]))
+            # 长名路径以前直接画 ROM 全名，屏幕上带着 ".GBC"，而卡上写的是
+            # ".sav" —— 一屏两个后缀。现在统一截到最后一个点之前。
+            r.ck("确认屏名字不带扩展名（长名路径也统一）",
+                 "GBC" not in rows[8] and "gbc" not in rows[8]
+                 and ".SAV" not in rows[8],
                  repr(rows[8]))
             r.ck("确认屏 A= 后面是「备份」",
                  rows[11].strip().startswith("A=")

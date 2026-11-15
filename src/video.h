@@ -53,6 +53,7 @@ void cjk_begin(void);
  * 消失好。返回占了几列。*/
 uint8_t cjk_puts_ucs2(uint8_t row, uint8_t col, const uint16_t *s);
 void    cjk_center_ucs2(uint8_t row, const uint16_t *s);
+void    cjk_center_ucs2_base(uint8_t row, const uint16_t *s);
 
 /* 备份流程的三屏（共用，模拟器也编）。lfn 可为 NULL / 空串，
  * 那时退回显示过滤过的 8.3 短名。*/

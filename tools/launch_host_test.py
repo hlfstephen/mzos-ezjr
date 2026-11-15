@@ -493,39 +493,53 @@ def run_game_case(name, hdr, size_bytes):
 
 
 def stat_launch_section():
-    """静态检查 ROM 里的 handoff 段：不许有 call/jp 绝对地址，LD HL 只能指向
-    $7Fxx 或 $A000。这是「搬到 WRAM 执行」的前提，错了真机会随机死机。"""
-    rom_path = os.path.join(ROOT, "build", "ezgb.dat")
+    """静态检查 handoff 段：不许有 call/jp 绝对地址，LD HL 只能指向 $7Fxx、
+    $A000 或游戏头部 $0104。这是「搬到 WRAM 执行」的前提，错了真机会随机死机。
+
+    检查改读汇编列表（build/obj/launch.lst），不再对机器码字节流做模式匹配 ——
+    字节流扫描会把 jr 的偏移量和立即数当成指令，段一变长就误报（曾经把
+    `jr nz` 的偏移 0x23 和后面的 `ld a,(hl)` 拼成 `LD HL,$7E23`）。
+
+    $0104 是特意放行的：装载完成后这段要读游戏的 Nintendo logo 判成功与否，
+    那时 cart 空间里已经是装载结果，$0104 是 cart 的绝对地址，不需要重定位。
+    只放行这一个地址，是怕有人顺手把 LD HL 指回内核自己的 ROM。
+    失败时切 LCD 开关用到的 $FF40/$FF47 走的是 `ld (nn),a`，不经过 LD HL，无需放行。
+    """
+    import re
+    lst_path = os.path.join(ROOT, "build", "obj", "launch.lst")
     map_path = os.path.join(ROOT, "build", "obj", "ezgb.map")
-    if not (os.path.exists(rom_path) and os.path.exists(map_path)):
+    if not os.path.exists(lst_path):
         print("  跳过 launch 段静态检查（未构建）")
         return True
-    m = open(map_path).read()
-    import re
-    a = re.search(r"([0-9A-F]{8})\s+_launch_start", m)
-    b = re.search(r"([0-9A-F]{8})\s+_launch_end", m)
-    if not (a and b):
-        print("  FAIL launch 段符号缺失")
-        return False
-    s0, s1 = int(a.group(1), 16), int(b.group(1), 16)
-    rom = open(rom_path, "rb").read()
-    code = rom[s0:s1]
+    n_ins = 0
     bad = []
-    if 0xCD in code:
-        bad.append("含 CALL")
-    if 0xC3 in code:
-        bad.append("含 JP nn")
-    if 0xE9 in code:
-        bad.append("含 JP HL")
-    for i, byte in enumerate(code):
-        if byte == 0x21 and i + 2 < len(code):        # LD HL,nn
-            tgt = code[i + 1] | (code[i + 2] << 8)
-            if not (0x7F00 <= tgt <= 0x7FFF or tgt == 0xA000):
-                bad.append(f"+${i:02X} LD HL,${tgt:04X}")
+    for line in open(lst_path, encoding="utf-8", errors="replace"):
+        if not re.match(r"^\s+[0-9A-F]{6}\s", line):
+            continue                                   # 注释 / 空行
+        n_ins += 1
+        low = line.lower()
+        if re.search(r"\bcall\b", low):
+            bad.append("含 call：" + low.split(")", 1)[-1].strip())
+        if re.search(r"\bjp\b", low):
+            bad.append("含 jp：" + low.split(")", 1)[-1].strip())
+        m = re.search(r"ld\s+hl\s*,\s*#?\$?0x([0-9a-f]+)", low)
+        if m:
+            tgt = int(m.group(1), 16)
+            if not (0x7F00 <= tgt <= 0x7FFF or tgt in (0xA000, 0x0104)):
+                bad.append("LD HL,$%04X" % tgt)
+
+    size = "?"
+    if os.path.exists(map_path):
+        m = open(map_path).read()
+        a = re.search(r"([0-9A-F]{8})\s+_launch_start", m)
+        b = re.search(r"([0-9A-F]{8})\s+_launch_end", m)
+        if a and b:
+            size = "%d 字节" % (int(b.group(1), 16) - int(a.group(1), 16))
+
     if bad:
-        print(f"  FAIL launch 段 ${s0:04X}-${s1:04X}（{len(code)} 字节）：" + ", ".join(bad))
+        print("  FAIL launch 段（%s，%d 条指令）：" % (size, n_ins) + "；".join(bad))
         return False
-    print(f"  OK   launch 段 ${s0:04X}-${s1:04X}（{len(code)} 字节）无绝对跳转、地址全在寄存器区")
+    print("  OK   launch 段（%s，%d 条指令）无 call/jp、LD HL 全在允许范围" % (size, n_ins))
     return True
 
 

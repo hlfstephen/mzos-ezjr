@@ -31,8 +31,10 @@ window_host_test.py — 存档全流程 + **$A000 窗口择路**的主机侧验�
 用法：python3 tools/window_host_test.py
 """
 import hashlib
+import atexit
 import os
 import subprocess
+import shutil
 import sys
 import tempfile
 
@@ -47,7 +49,34 @@ PSRAM_PAGES = 0x20          # 256 KB / 8 KB
 PSRAM_META = 0x11
 ROM_CLUSTER = 2             # 镜像里假 ROM 的起始簇
 SUBDIR_CLUSTER = 5          # 镜像里假子目录的簇（验证存档不会写到这里）
-NAME11 = b"POKEMON SAV"
+def sav_ident_py(name83, lfn=None):
+    """复刻 src/savkey.c 的 sav_ident()，返回目录项里的 11 字节原始名。
+
+    存档短名现在是「完整长名的 28 位哈希」（S1A2B3C4.SAV），中文 ROM 之间
+    不再撞名。测试要按这个名字去卡上找文件，否则永远找不到。"""
+    h = 0x811C9DC5
+    if lfn:
+        for c in lfn:
+            h = ((h << 5) + h + (c & 0xFF)) & 0xFFFFFFFF
+            h ^= (c >> 8) & 0xFF
+    else:
+        for ch in name83.split(".")[0][:8]:
+            h = ((h << 5) + h + ord(ch)) & 0xFFFFFFFF
+    out = "S"
+    for _ in range(7):
+        v = h & 0xF
+        out += chr(ord("0") + v) if v < 10 else chr(ord("A") + v - 10)
+        h >>= 4
+    return (out + "SAV").encode()
+
+
+def sav_ident_str(name83, lfn=None):
+    """同 sav_ident_py，但返回 "S1A2B3C4.SAV" 这种点分形式（给 C 侧用）。"""
+    raw = sav_ident_py(name83, lfn)
+    return raw[:8].decode() + ".SAV"
+
+
+NAME11 = sav_ident_py("POKEMON.GBC")
 
 
 def pat(k, tag):
@@ -634,11 +663,41 @@ int main(int argc, char **argv)
         pr_scr();
         wr_img(argv[2]);
 
-        if (fat_open_read(&ff, "POKEMON", &sz) == FAT_OK)
+        if (fat_open_read(&ff, "SAVNAME83", &sz) == FAT_OK)
             printf("ROOT_READ %u\n", (unsigned)sz);
         else
             printf("ROOT_READ 0\n");
         printf("HASH_END %08lX\n", hash_save());
+        return 0;
+    }
+
+    if (op == 'K') {                    /* ★ sav_ident 必须是不改写输入的纯函数 */
+        uint16_t buf[24], copy[24];
+        char a[13], b[13];
+        unsigned i;
+
+        for (i = 0; i < 24; i++) buf[i] = (uint16_t)(0x4E00 + i * 37);
+        buf[20] = 0;
+        memcpy(copy, buf, sizeof buf);
+        sav_ident("POKEMON.GBC", buf, a);
+        sav_ident("POKEMON.GBC", buf, b);
+        /* 如果哪天有人为了省 96 字节，改成在 sav_ident 里就地写 lfn，这两条就红：
+         * 纯函数被破坏之后，save_boot 里「先算名、再交给 fat_open_sav」的顺序
+         * 就不再安全 —— 那正是 v0.16.0 真机翻车的机制。*/
+        printf("K_PURE %u\n", (unsigned)(memcmp(buf, copy, sizeof buf) == 0));
+        printf("K_IDEM %u\n", (unsigned)(strcmp(a, b) == 0));
+        printf("K_ID %s\n", a);
+        return 0;
+    }
+
+    if (op == 'Z') {                    /* ★ 中文长名端到端：启动 → 游戏内存档 → 备份 */
+        banks = save_prepare(&g);
+        printf("Z_BANKS %u\n", banks);
+        fill_save(TAG2_);               /* 游戏里存了一次 */
+        save_boot();                    /* fat_full_lfn → sav_ident → dump → verify */
+        printf("Z_WRITES %u\n", g_wr_sectors);
+        pr_scr();
+        wr_img(argv[2]);
         return 0;
     }
 
@@ -671,7 +730,7 @@ int main(int argc, char **argv)
         {                               /* 模拟换卡上的文件：把 .SAV 第一个字节翻一下 */
             FatFile f;
             uint32_t sz = 0;
-            if (fat_open_read(&f, "POKEMON", &sz) == FAT_OK) {
+            if (fat_open_read(&f, "SAVNAME83", &sz) == FAT_OK) {
                 size_t off = (size_t)fat_cluster_lba(f.cluster) * 512;
                 g_img[off] ^= 0xFF;
                 printf("CARD_BYTE %02X\n", g_img[off]);
@@ -707,7 +766,8 @@ def build(tmp, tag, tag2):
     code = (PROG.replace("TAG_", str(tag)).replace("TAG2_", str(tag2))
                 .replace("PSRAM_META_", hex(PSRAM_META))
                 .replace("SUBDIR_CLUSTER", str(SUBDIR_CLUSTER))
-                .replace("TOTAL_SEC", str(TOTAL_SEC)))
+                .replace("TOTAL_SEC", str(TOTAL_SEC))
+                .replace("SAVNAME83", sav_ident_str("POKEMON.GBC")))
     open(stub, "w").write(code)
     hh = os.path.join(tmp, "host_hw.h")
     open(hh, "w").write(HOST_HW)
@@ -716,6 +776,7 @@ def build(tmp, tag, tag2):
            os.path.join(SRC, "fpga.c"), os.path.join(SRC, "fat.c"),
            os.path.join(SRC, "fatw.c"), os.path.join(SRC, "fatn.c"),
            os.path.join(SRC, "fatx.c"), os.path.join(SRC, "save.c"),
+           os.path.join(SRC, "savkey.c"),
            "-o", exe]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
@@ -764,6 +825,78 @@ def seed_rom(img, geo, ram=3):
         f.seek(geo["root_lba"] * SEC + 32)      # 根目录第 1 槽（第 0 槽是卷标）
         ent = bytearray(32)
         ent[0:11] = b"POKEMON GBC"
+        ent[11] = 0x20
+        ent[26] = ROM_CLUSTER & 0xFF
+        ent[27] = ROM_CLUSTER >> 8
+        ent[28:32] = (2048).to_bytes(4, "little")
+        f.write(ent)
+
+
+def lfn_checksum(name11):
+    """VFAT 短名校验和：11 字节循环右移累加。"""
+    s = 0
+    for b in name11:
+        s = (((s & 1) << 7) + (s >> 1) + b) & 0xFF
+    return s
+
+
+def lfn_entries(name11, text):
+    """把长名切成 VFAT LFN 目录项（UCS-2LE）。
+
+    物理顺序是**倒序**的：最后一段（序号 n，带 0x40）排在最前，序号 1 紧邻
+    短名项。fat_full_lfn() 正是按序号摆回去的（fatn.c:80-95），所以这里必须
+    照 FAT 规范生成，不能顺序写。
+    """
+    chk = lfn_checksum(name11)
+    u = [ord(c) for c in text] + [0]                 # 结尾 0x0000
+    while len(u) % 13:
+        u.append(0xFFFF)                             # 尾部填充
+    n = len(u) // 13
+    ents = []
+    for seq in range(n, 0, -1):
+        chunk = u[(seq - 1) * 13: seq * 13]
+        e = bytearray(32)
+
+        def put(off, chars):
+            for k, c in enumerate(chars):
+                e[off + 2 * k] = c & 0xFF
+                e[off + 2 * k + 1] = (c >> 8) & 0xFF
+
+        e[0] = 0x40 | seq if seq == n else seq
+        put(1, chunk[0:5])                           # 字符 0-4
+        e[11] = 0x0F                                 # 属性：长名
+        e[13] = chk
+        put(14, chunk[5:11])                         # 字符 5-10
+        put(28, chunk[11:13])                        # 字符 11-12
+        ents.append(bytes(e))
+    return ents
+
+
+def seed_rom_lfn(img, geo, name83, text, ram=3):
+    """假 ROM + 卡上的中文长名（LFN）。
+
+    ★ 这是 v0.16.0「长名 ROM 备份失败」那个 bug 的唯一可测形状：
+      seed_rom() 只写 8.3 项 → fat_full_lfn() 返回 0 → sav_ident() 走
+      「8.3 名派生」分支 → 两个名字天然一致，bug 永远测不出来。
+      真机上的中文 ROM 一定带 LFN，走的是另一条分支：sav_ident() 读
+      g_lfn_buf，而 fat_open_sav() 会把这个缓冲**就地**改成 "….sav"。
+    """
+    rom = bytearray(SEC)
+    rom[0:8] = b"KCHN\x00\x00\x00\x00"
+    rom[0x149] = ram
+    ents = lfn_entries(name83, text)
+    with open(img, "r+b") as f:
+        f.seek(geo["data_lba"] * SEC)
+        f.write(rom)
+        for k in range(2):
+            f.seek((RES_SEC + k * geo["fat_sz"]) * SEC + ROM_CLUSTER * 2)
+            f.write(b"\xff\xff")
+        # 槽 0 是卷标（build_image 已写），LFN 从槽 1 起，短名项紧随其后。
+        f.seek(geo["root_lba"] * SEC + 32)
+        for e in ents:
+            f.write(e)
+        ent = bytearray(32)
+        ent[0:11] = name83
         ent[11] = 0x20
         ent[26] = ROM_CLUSTER & 0xFF
         ent[27] = ROM_CLUSTER >> 8
@@ -945,6 +1078,8 @@ def main():
     ok = True
 
     tmp = tempfile.mkdtemp(prefix="ezjr-win-")
+    # 每个用例都要建几十 MB 的 FAT 镜像，不清理会把 /tmp 撑爆（曾漏出 124 GB）
+    atexit.register(shutil.rmtree, tmp, True)
     img = os.path.join(tmp, "card.img")
     geo = build_image(img, False)
     seed_rom(img, geo)
@@ -1085,7 +1220,7 @@ def main():
     else:
         print(f"  FAIL 第二次备份显示 行8={o.get('SCR8')} / 行9={o.get('SCR9')}")
         ok = False
-    f = parse_file(open(img, "rb").read(), geo, b"OTHER   SAV")
+    f = parse_file(open(img, "rb").read(), geo, sav_ident_py("OTHER.GBC"))
     if f and f["size"] == 32768 and f["data"] == pattern(0x5A):
         print("  OK   OTHER.SAV 32KB，内容等于这一局的 PSRAM")
     else:
@@ -1113,6 +1248,68 @@ def main():
         got = f["data"][0] if f else None
         print(f"  FAIL 首字节成了 {got}，期望 {want_mark:02X}")
         ok = False
+
+    # --- 7c. sav_ident 纯函数不变量 ---
+    print("\n== 7c. sav_ident 是纯函数（不改写输入、同输入同输出）==")
+    o = run(exe, "K", img)
+    if o.get("K_PURE") == "1":
+        print("  OK   调用后 lfn 缓冲逐字节未变（没有就地改写）")
+    else:
+        print("  FAIL sav_ident 改写了传入的长名缓冲")
+        ok = False
+    if o.get("K_IDEM") == "1":
+        print(f"  OK   连调两次结果相同：{o.get('K_ID')}")
+    else:
+        print("  FAIL 连调两次结果不同")
+        ok = False
+
+    # --- 7b. 中文长名 ROM：启动 → 存档 → 备份（v0.16.0 真机翻车的形状） ---
+    # 真机现象：「K 口袋怪兽 水晶版」备份失败 + 校验失败，而 1.gbc 正常。
+    # 差别只有一个：1.gbc 是纯 8.3 名，目录里没有 LFN 项，fat_full_lfn() 返回 0，
+    # sav_ident() 走「8.3 名派生」分支，同一份输入算几次都一样；中文 ROM 有 LFN，
+    # sav_ident() 读的是 g_lfn_buf，而 fat_open_sav() 会把这块**共用 scratch**
+    # 就地改成 "….sav" —— 再算一次就是另一个名字了。
+    # 旧测试的假 ROM 全叫 POKEMON.GBC（无 LFN），所以这个形状一次都没被覆盖。
+    print("\n== 7b. 中文长名 ROM（卡上有 LFN）→ 备份必须按长名哈希落盘 ==")
+    for case, (short83, cn) in enumerate((
+            (b"KCHN    GBC", "K 口袋怪兽 水晶版.gbc"),
+            (b"PKM2    GBC", "口袋妖怪 加强版2.0 金手指.gbc"),
+            (b"PKMC    GBC", "口袋妖怪 皮卡丘版.gbc"),
+            (b"K       GBC", "K 口袋妖怪 水晶 金手指 中文版.gbc"))):
+        tag = cn[:10]
+        img3 = os.path.join(tmp, "card_lfn_%d.img" % case)
+        geo3 = build_image(img3, False)
+        seed_rom_lfn(img3, geo3, short83, cn)
+        gname = short83[:8].decode().rstrip() + ".GBC"
+        o = run(exe, "Z", img3, gname)
+
+        if o.get("SCR9") == "ZH_DONE":
+            print(f"  OK   [{tag}] 备份结果屏是「完成」")
+        else:
+            print(f"  FAIL [{tag}] 备份结果屏是 {o.get('SCR9')}（长名 ROM 备份失败）")
+            ok = False
+
+        data3 = open(img3, "rb").read()
+        want_id = sav_ident_py(gname, [ord(c) for c in cn])
+        f = parse_file(data3, geo3, want_id)
+        if f and f["size"] == 32768 and f["data"] == pattern(0x5A):
+            print(f"  OK   [{tag}] 按长名哈希 {want_id[:8].decode()} 找到 32KB .SAV，"
+                  f"内容逐字节一致")
+        else:
+            print(f"  FAIL [{tag}] 按长名哈希 {want_id[:8].decode()} 找不到正确的 .SAV"
+                  f"（size={f['size'] if f else None}）")
+            ok = False
+
+        # 反证：把长名当成已被改成 ".sav" 的版本再哈希一次，卡上不该存在这个文件。
+        # 这正是旧代码 save_verify() 实际做的事 —— 两个名字必须是不同的。
+        wrong_id = sav_ident_py(gname, [ord(c) for c in cn.rsplit(".", 1)[0] + ".sav"])
+        if wrong_id != want_id and parse_file(data3, geo3, wrong_id) is None:
+            print(f"  OK   [{tag}] 卡上没有「长名被改成 .sav 后再哈希」的第二个名字"
+                  f"（{want_id[:8].decode()} ≠ {wrong_id[:8].decode()}）")
+        else:
+            print(f"  FAIL [{tag}] 出现第二个名字或两个哈希相同："
+                  f"{want_id[:8].decode()} / {wrong_id[:8].decode()}")
+            ok = False
 
     # --- 8. 子目录里的游戏：SAVER 全卡只有一个，在根目录 ---
     # v0.11.0 按真机反馈改的：v0.10.0 曾在 ROM 所在目录各建一个 SAVER，

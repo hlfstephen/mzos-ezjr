@@ -111,6 +111,16 @@ uint8_t fat_find(const char *name11, uint32_t *cluster, uint32_t *size);
  * .sav 长名）共用这一份，避免任何一个函数背着几十上百字节的栈帧（sm83 装不下）。*/
 extern uint16_t g_lfn_buf[FAT_LFN_FULL];
 
+/* 存档身份：ROM 名 → 8.3 短名 "S1A2B3C4.SAV"（见 src/savkey.c）。
+ *
+ * 为什么需要：中文 ROM 在卡上的 8.3 名是 GBK 硬截断，不同游戏会算出同一个
+ * 名字，存档互相覆盖。这里用完整长名算 28 位哈希，纯函数、零 I/O、编在
+ * 常驻区。lfn 为空时退回按 8.3 名派生，读写两侧仍然一致。
+ *
+ * 输出是点分字符串，直接交给 fat_open_sav / fat_open_read 即可 —— 它们内部
+ * 的 sav_name() 会截到点并补 "SAV" 扩展名，正好还原成 11 字节原始项。*/
+void sav_ident(const char *name83, const uint16_t *lfn, char *out);
+
 /* 构建 512 字节加载命令（格式见 docs/06-launch-plan.md §4.1）。
  * cmd 由调用者提供，需 512 字节可写空间。返回 FAT_OK 或错误码。*/
 uint8_t fat_build_cmd(uint32_t cluster, uint32_t size, uint8_t *cmd);
@@ -139,11 +149,32 @@ uint8_t fat_write_sec(FatFile *f, const uint8_t *src);
 /* 打开已有的 `<ROM名>.SAV` 准备顺序读；不存在返回 FAT_ERR_NO_FS。*/
 uint8_t fat_open_read(FatFile *f, const char *rom_name, uint32_t *size);
 
+/* 把 ROM 长名换成存档长名：「口袋妖怪 水晶.gbc」→「口袋妖怪 水晶.sav」，
+ * 返回字符数。rom 与 out 可以**指向同一个缓冲**（逐字节原地改写，调用点靠这个
+ * 省掉一份 96 字节的暂存）。末位扩展名换成 .sav，主体一个字都不截断。*/
+uint8_t fat_sav_lfn(const uint16_t *rom, uint16_t *out);
+
+/* 按**长名**找存档（src/fatn.c，编在 _CODE）。卡上从电脑拷回 SAVER/ 的 .sav，
+ * 长名改过之后短名是系统现生成的（S1A2~1.SAV 之类），跟 sav_ident() 的哈希名
+ * 对不上 —— 这时只能比长名。只扫根目录的 SAVER/，一处。比较范围是名字**开头 13 个字符**
+ * （LFN 项里序号为 1 的那条），名字更长时靠调用方的「大小必须是 banks×8KB」兜底。
+ *
+ * ★ 名字**必须已经在 g_lfn_buf 里**（fat_full_lfn 刚刚填过），函数会就地把它改成
+ *   「….sav」——省一份 96 字节缓冲，_DATA 已经没地方了。所以调用方必须先用原名
+ *   算完 sav_ident 再进来。命中后填好 f（已定位到首簇），并把它的 8.3 短名写进
+ *   g_sav_adopt（备份写回用）。返回 FAT_OK / FAT_ERR_NO_FS。*/
+uint8_t fat_find_sav_lfn(FatFile *f);
+
 /* 在 dir（0 = 根目录）里按完整 8.3 名 name83 找一个 ROM，把它的**完整**长名
  * 读进 out（最多 max-1 个 UCS-2 + 0），返回字符数；没找到 / 没长名返回 0。
  * 备份存档时用：存档长名必须跟 ROM 长名逐字相同（只换 .sav 扩展名），卡上
  * 的加载器才按文件名配对。出口还原 fat_cwd，不影响调用方。*/
 uint8_t fat_full_lfn(uint32_t dir, const char *name83, uint16_t *out);
+
+/* 把目录里「中间 $00 + 后面还有有效项」改成 $E5 —— 修 v0.12.x 把终止符
+ * 写进目录中间造成的历史截断。只改 $00→$E5，不动任何有效项，无断电丢档
+ * 风险；正常目录零写入。返回改动的槽数。实现在 src/fatx.c（_CODE）。*/
+uint8_t fat_dir_heal(uint32_t dir);
 
 /* ---- 内部：目录遍历原语（src/fat.c，编在 BANK1）----
  * 只有 fat_full_lfn（src/fatn.c，编在 _CODE）要用。导出而不复制，是为了让

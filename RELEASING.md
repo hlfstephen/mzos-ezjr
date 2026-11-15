@@ -20,7 +20,7 @@ git push origin --tags
 
 - 仓库首页语言统计里 Assembly + C 占主体（不是 100% 文档）；
 - `LICENSE` 被 GitHub 识别为 **AGPL-3.0**；
-- Release 页有 `v0.14.0` 的 tag，附件是第 3 节的四样东西。
+- Release 页有最新版的 tag，附件是第 3 节的四样东西。
 
 ## 1. 版本号只有一个来源
 
@@ -28,9 +28,9 @@ git push origin --tags
 
 | 位置 | 内容 |
 |---|---|
-| `src/main.c` 的 `MZOS_VER` | `"V0.14.0"` —— 设置页版本行显示 `MZOS V0.14.0 FW5` |
-| `CHANGELOG.md` 顶部小节 | `## v0.14.0 — YYYY-MM-DD` |
-| git tag | `v0.14.0`（不带前缀 `MZOS`） |
+| `src/main.c` 的 `MZOS_VER` | `"V0.16.4"` —— 设置页版本行显示 `MZOS V0.16.4 FW5` |
+| `CHANGELOG.md` 顶部小节 | `## v0.16.4 — YYYY-MM-DD` |
+| git tag | `v0.16.4`（不带前缀 `MZOS`） |
 
 `build.sh` 会把 `MZOS_VER` 的长度算进版本行位置，所以**不要手改显示宽度**。
 
@@ -41,26 +41,32 @@ git push origin --tags
 
 ```sh
 sh tools/verify_all.sh          # 构建 + 静态 + 主机侧 + 模拟器；必须全绿
-./build.sh && ./build.sh --diag # 两版都要能编进 32 KB
+./build.sh && ./build.sh --diag # 两版都要能编
 python3 tools/verify_rom.py build/ezgb.dat
 ```
 
 看两件事：
 
-1. **段余量**：`段布局` 那行里 `_BANK1` 必须 < `$8000`。`--diag` 版常年只剩个位数，
-   加任何东西之前先确认还有地方放。
+1. **段余量**：v0.16.6 起 ROM 是 128 KB / 8 bank，每个功能组一个 bank
+   （[docs/12-bank-layout.md](docs/12-bank-layout.md)）。看 `段布局` 那几行：
+   `_CODE`（bank0）与 `_BANK1` 各自 < `$4000` / `$8000`，可切 bank 各自 < 16 KB。
+   现在正式版 `_CODE` 余 5990、`_BANK1` 余 4327、bank2 余 6853；`--diag` 版只多
+   一个 bank4（603 字节）。加功能时先看它要进哪个 bank —— 满了就开 bank6/7，不要
+   再往常驻段里塞。
 2. **断言数**：`verify_all.sh` 末尾的 OK 计数要与 `docs/03-verification.md` 写的一致
-   （现在是 286）。
+   （v0.16.15 实测 374）。另外 `verify_banklayout.py` 每个可切 bank 都会打印段表 ——
+   `_HOME` 必须落在 `$4000-$41FF`、`_CODE` 不越过 `$7000`，任何一个段跑到
+   `$Dxxx` 就是「库代码又进 RAM 了」。
 
 ## 3. 产物构成
 
 一个 Release 至少要有这四样：
 
 ```
-ezgb.dat                      正式版（32 KB，装卡用）
+ezgb.dat                      正式版（64 KB / 4 bank，装卡用）
 EZJR.FNT                      卡上汉字字库（164 KB，与 ezgb.dat 一起放根目录）
 diag/ezgb.dat                 自检版（排障用，日常不要装）
-restore/ezgb.dat              回退版（上一个 stable 的正式版）
+restore/ezgb.dat              回退版（上一个 stable 的正式版，v0.14.0）
 MD5SUM.txt                    上面四个的校验和
 测试步骤.md                    这一版要测什么、怎么判断成功
 ```
@@ -85,13 +91,13 @@ cd dist && md5sum ezgb.dat diag/ezgb.dat restore/ezgb.dat EZJR.FNT > MD5SUM.txt
 
 ```sh
 git add -A
-git commit -m "release: v0.14.0"
-git tag -a v0.14.0 -m "v0.14.0: 游戏列表左右键整页翻"
+git commit -m "release: v0.16.4"
+git tag -a v0.16.4 -m "v0.16.4: 启动判定改用装载器 busy 信号"
 git push origin main --tags
 
 # GitHub Release（gh CLI）
-gh release create v0.14.0 dist/*.dat dist/EZJR.FNT dist/MD5SUM.txt dist/测试步骤.md \
-  --title "v0.14.0 — 游戏列表左右键整页翻" \
+gh release create v0.16.4 dist/*.dat dist/EZJR.FNT dist/MD5SUM.txt dist/测试步骤.md \
+  --title "v0.16.4 — 启动判定改用装载器 busy 信号" \
   --notes-file /tmp/release-notes.md
 ```
 

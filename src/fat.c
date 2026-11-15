@@ -69,7 +69,7 @@ uint8_t fat_dir_up(void)
     return 1;
 }
 
-static uint32_t cluster_sector(uint32_t c)
+uint32_t cluster_sector(uint32_t c)
 {
     return fdata_base + ((c - 2) << fspc_shift);
 }
@@ -246,64 +246,6 @@ uint16_t fat_fat_offset(uint32_t c, uint32_t *fs)
     return (uint16_t)((c & 0xFF) * 2);
 }
 
-/* 展开簇链时的 FAT 扇区缓存。借用 fbuf 而不是自己再开 512 字节：
- * _DATA 只剩不到 200 字节，再来一个静态 512 缓冲就顶到 $D000 handoff 区了。
- * dir_chain() 运行期间 fbuf 只装 FAT 扇区，返回后调用者才开始读目录扇区，
- * 两者不重叠，所以可以共用。*/
-static uint8_t  fchain_ok;
-static uint32_t fchain_lba;
-
-static uint32_t fat_next_fbuf(uint32_t c)
-{
-    uint32_t fs;
-    uint16_t off = fat_fat_offset(c, &fs);
-
-    if (!fchain_ok || fchain_lba != fs) {
-        sd_read(fs, fbuf);
-        fchain_lba = fs;
-        fchain_ok  = 1;
-    }
-    if (fis_fat32)
-        return ld32(fbuf + off) & 0x0FFFFFFFUL;
-    return ld16(fbuf + off);
-}
-
-/* 填目录扇区表。dir = 0 是根目录，否则是子目录首簇。
- * 返回扇区个数（最多 cap）。FAT16 的根目录是紧跟 FAT 的一片连续扇区；
- * 子目录和 FAT32 根目录都走簇链。
- *
- * cap 传 32：FAT16 根目录正好 32 扇区（512 个条目）；子目录在 4KB 簇时
- * 32 扇区 = 4 簇 = 16KB 目录，也够 512 项。列表上限 64 条早就截断了。*/
-uint8_t dir_chain(uint32_t dir, uint32_t *chain, uint8_t cap)
-{
-    uint8_t  n = 0;
-    uint16_t i;
-    uint32_t c;
-
-    fchain_ok = 0;
-
-    if (dir == 0 && !fis_fat32) {
-        for (i = 0; i < froot_sectors && n < cap; i++)
-            chain[n++] = (uint32_t)(froot_lba + i);
-        return n;
-    }
-
-    c = (dir == 0) ? froot_cluster : dir;
-    /* ★ 链尾判据要按 FAT 类型分开写：FAT16 的 EOF 标记是 $FFF8-$FFFF，
-     * 而 $FFF8-$FFFF 全都小于 $0FFFFFF8 —— 只用 FAT32 那个门限，FAT16 上
-     * 链尾会被当成合法簇号继续走，把 cluster_sector(65535) 这种天文数字
-     * 当成 LBA 去读（真机上读回垃圾、主机测试里直接越界）。
-     * 以前只有根目录走 dir_chain（FAT16 走上面那个连续扇区分支），所以没露馅；
-     * v0.12.0 的 fat_full_lfn 第一次让子目录也走簇链，才踩到。*/
-    while (c >= 2 && c < (fis_fat32 ? 0x0FFFFFF8UL : 0xFFF8UL) && n < cap) {
-        uint32_t nxt = fat_next_fbuf(c);
-        for (i = 0; i < fcsize && n < cap; i++)
-            chain[n++] = cluster_sector(c) + i;
-        c = nxt;
-    }
-    fchain_ok = 0;                       /* fbuf 马上要被目录扇区覆盖 */
-    return n;
-}
 
 /* 按 8.3 短名（11 字节，空格补齐，全大写）在根目录里找一个文件。
  * 找到返回 1，并填首簇与大小。字库文件 EZJR.FNT 就是这么定位的。

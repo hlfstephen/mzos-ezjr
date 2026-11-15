@@ -33,6 +33,25 @@
 #include "strings.h"
 #include "fat.h"
 
+/* 字模数据（font_data.c）在正式版编进 bank5：读之前把 $2000 切到 5，读完切回**调用者的 bank**。
+ * 主机测试与模拟器版（EZJR_TEST）里它是普通内存，宏是空操作。
+ *
+ * 为什么安全：这两个调用点都在 _CODE（bank0，$0000-$3FFF 常驻），切换瞬间
+ * CPU 不在被换掉的窗口里。
+ *
+ * ★ 切回 1 是错的：video 也可能被 bank2 的 fatw 调（显示「备份中」之类），
+ * 那时调用者的返回地址在 $4xxx，切回 bank1 会让它跳到 bank1 的同址字节上。
+ * 所以回切用 _far_cur —— far call 进目标 bank 时它就记着当前是几号 bank，
+ * 顶层（主循环）时它是 1，两种情况都对。*/
+#ifdef EZJR_FONT_BANKED
+extern uint8_t _far_cur;                 /* src/farcall.s */
+#define FONT_BANK_ENTER()  ((void)(ROM_BANK = 5))
+#define FONT_BANK_LEAVE()  ((void)(ROM_BANK = _far_cur))
+#else
+#define FONT_BANK_ENTER()  ((void)0)
+#define FONT_BANK_LEAVE()  ((void)0)
+#endif
+
 #define TILE_BASE   ((uint8_t *)0x8000)
 #define MAP_BASE    ((uint8_t *)0x9800)
 #define SCR_W       20
@@ -146,10 +165,12 @@ void video_init(void)
 
     memset((void *)0x8000, 0, 0x2000);  /* 整个 VRAM：tile 数据 + 两片 tilemap */
 
+    FONT_BANK_ENTER();
     for (i = 0; i < SYM_COUNT; i++)
         vram_tile((uint8_t)(SYM_FIRST + i), cjk_symbols[i]);
     for (i = 0; i < ASCII_COUNT; i++)
         vram_tile((uint8_t)(ASCII_FIRST + i), ascii_font[i]);
+    FONT_BANK_LEAVE();
 
     memset((void *)0x9800, 0, 0x800);
     memset((void *)0x9C00, 0, 0x800);
@@ -334,9 +355,14 @@ static uint8_t pool_get(uint16_t cp, const uint8_t *rom)
 /* 界面汉字：码点从 cjk_cp[] 查到，点阵就在 ROM 里 */
 static uint8_t cjk_tile(uint8_t id)
 {
+    uint8_t t;
+
     if (id < 1 || id > CJK_COUNT)
         return 0;
-    return pool_get(cjk_cp[id - 1], cjk_font[id - 1]);
+    FONT_BANK_ENTER();
+    t = pool_get(cjk_cp[id - 1], cjk_font[id - 1]);
+    FONT_BANK_LEAVE();
+    return t;
 }
 
 uint8_t cjk_width(const uint8_t *str)
@@ -410,7 +436,11 @@ void cjk_center_wide(uint8_t row, const uint8_t *str)
  *
  * 字模不在 ROM 里，得靠 fnt_glyph() 从 SD 卡的字库文件读。字库不可用时返回
  * 0，调用者退回显示 8.3 短名。*/
-uint8_t cjk_puts_ucs2(uint8_t row, uint8_t col, const uint16_t *s)
+/* max：最多画几个字符。备份屏要把「K ….gbc」截成「K …」再居中，
+ * 所以需要「画前 n 个」而不是「画到 NUL」—— 长名缓冲不能就地截断，
+ * 后面 sav_ident()/fat_open_sav() 还要用它。*/
+static uint8_t cjk_puts_ucs2_n(uint8_t row, uint8_t col, const uint16_t *s,
+                               uint8_t max)
 {
     uint8_t *p = MAP_BASE + (uint16_t)row * 32 + col;
     uint8_t n = 0;
@@ -418,7 +448,7 @@ uint8_t cjk_puts_ucs2(uint8_t row, uint8_t col, const uint16_t *s)
 
     if (col >= SCR_W)
         return 0;
-    while ((cp = *s++) != 0 && col < SCR_W) {
+    while (n < max && (cp = *s++) != 0 && col < SCR_W) {
         uint8_t t;
 
         /* ASCII 直接拿字符码当 tile 号。中文名里常混着 "K 口袋妖怪" 这种：
@@ -436,6 +466,32 @@ uint8_t cjk_puts_ucs2(uint8_t row, uint8_t col, const uint16_t *s)
         n++;
     }
     return n;
+}
+
+uint8_t cjk_puts_ucs2(uint8_t row, uint8_t col, const uint16_t *s)
+{
+    return cjk_puts_ucs2_n(row, col, s, SCR_W);
+}
+
+/* 备份屏专用：只画到**最后一个 '.' 之前**，不带扩展名。
+ * 卡上写的是 "….sav"，而 lfn 里是 ROM 原名 "….gbc"；屏幕上显示哪个都不对，
+ * 玩家的直觉是「我的存档叫什么」，所以统一显示主体名。
+ * 按**最后一个**点切，和 sav_lfn() 的规则一致 —— 名字里的 "2.0" 不能被吃掉。*/
+void cjk_center_ucs2_base(uint8_t row, const uint16_t *s)
+{
+    uint8_t len = 0, cut = 0;
+    const uint16_t *q = s;
+
+    while (*q && len < SCR_W) {
+        if (*q == '.')
+            cut = len;
+        q++;
+        len++;
+    }
+    if (cut)
+        len = cut;
+    clear_row(row);
+    cjk_puts_ucs2_n(row, (uint8_t)(len >= SCR_W ? 0 : (SCR_W - len) / 2), s, len);
 }
 
 /* 居中显示一串 UCS-2（中文文件名）。超过一行就从左边界开始，自然截断。*/
@@ -467,7 +523,10 @@ void screen_backup_confirm(const uint16_t *lfn, const char *shortname)
     cjk_center_wide(5, STR_BACKUP_Q);       /* 备份存档 */
 
     if (lfn && lfn[0]) {
-        cjk_center_ucs2(8, lfn);            /* 中文全名 */
+        /* 统一不带扩展名：长名、短名两条路径显示同一种东西（主体名）。
+         * 早先这里直接画 lfn，屏幕上带着 ".gbc"，而卡上写的是 ".sav"，
+         * 一个屏两个后缀，玩家会以为备份成了 .gbc。*/
+        cjk_center_ucs2_base(8, lfn);
     } else {
         /* 没有长名时把 8.3 短名里的非 ASCII 字节换成空格。中文名生成的
          * 短名常含 0x81 之类，原样画出来就是 "K?????~1" 那串乱码。*/
@@ -516,6 +575,25 @@ void screen_save_result(uint8_t err)
             cjk_center(12, STR_ERR_DIRFULL);     /* 目录已满 */
         else
             cjk_center(12, STR_ERR_UNKNOWN);     /* 未知错误 */
+
+#if defined(EZJR_DIAG) && EZJR_DIAG && !defined(EZJR_TEST_STUB)
+        /* 自检版把原始错误码画在行 14。正式版不画：ERR=06 对玩家等于没说话，
+         * 而排障时「未知错误」四个字帮不上任何忙 —— v0.16.9 那次「备份失败 /
+         * 未知错误」，代码里能落在这一支的至少有 6 个值。
+         * 码值见 src/fat.h 的 FAT_ERR_*。
+         *
+         * 模拟器自检版（EZJR_TEST_STUB）不画：那边 `emu_test.py` 有一条断言
+         * 明确要求屏幕上没有 ERR=，它守的是「正式版不露错误码」这件事。*/
+        {
+            static const char hx[] = "0123456789ABCDEF";
+            char b[8];
+            b[0] = 'E'; b[1] = 'R'; b[2] = 'R'; b[3] = '=';
+            b[4] = hx[(err >> 4) & 15];
+            b[5] = hx[err & 15];
+            b[6] = 0;
+            print_at(14, 0, b);
+        }
+#endif
     } else {
         cjk_center(10, STR_FINISHED);            /* 完成 */
     }
@@ -536,13 +614,15 @@ void screen_save_result(uint8_t err)
  *
  * 行 8 是「上次运行的游戏」的文件名 —— 光看菜单项不知道会启动哪个游戏，
  * 而按错一下就要重走一遍开机流程，所以把它挂在项下面。它跟同级菜单项的区别
- * 靠三点：缩进到第 6 列（菜单项从第 2 列起）、行首「空格─」引导、上下都不画
- * 框线（框线是用户点名要去掉的 —— 那两根线夹出来的更像一个输入框）。*/
+ * 只靠两点：缩进到第 3 列（菜单项从第 2 列起，只多一个字符）、上下都不画框线
+ *（框线是用户点名要去掉的 —— 那两根线夹出来的更像一个输入框）。
+ * v0.16.15 按真机反馈去掉行首的「─」引导符号：真机上看着像「- 」，多余，
+ * 改成只比上一项缩进一个字符即可。*/
 /* 行距是 2 而不是 1：8px 汉字的字形在 8x8 格里几乎顶满，隔一行还能看出
  * 是两句话，紧挨着就糊成一坨（备份屏的行 8/9 也是因为这个才改成 10/12）。*/
 #define MENU_TOP    4               /* 顶上的细线 */
 #define MENU_ITEM1  6               /* 运行上次游戏 */
-#define MENU_NAME   8               /* 上一项的文件名（空格─ 引导 + 缩进 6 列）*/
+#define MENU_NAME   8               /* 上一项的文件名（比菜单项多缩进 1 个字符）*/
 #define MENU_ITEM2 10               /* 删除当前文件 */
 #define MENU_ITEM3 12               /* 自检（仅 diag 版多这一项）*/
 #define MENU_RULE_C 2               /* 上下细线的起点列 */
@@ -568,15 +648,12 @@ void screen_menu(uint8_t has_last, const uint16_t *lfn, const char *shortname,
     if (has_last) {
         uint8_t w = 0;
 
-        /* 文件名是**上一项的附属信息**，不是同级菜单项。三个手段一起用：
-         *   ① 行首「空格─」引导符号（col2 留空、col3 一条横线）；
-         *   ② 缩进到第 6 列（菜单项从第 2 列起）；
-         *   ③ 上下不画任何框线 —— v0.11.0 那两根线夹出来的更像一个输入框，
-         *      按真机反馈去掉了。*/
-        put_tile(MENU_NAME, 3, SYM_HLINE);          /* 「空格─」：col2 留空、col3 是横线 */
-
+        /* 文件名是**上一项的附属信息**，不是同级菜单项。v0.16.15 起只靠两点
+         * 区分：① 比菜单项（col 2）多缩进一个字符，从 col 3 起；② 上下不画
+         * 框线（v0.11.0 那两根线夹出来的更像一个输入框，按真机反馈去掉了）。
+         * 行首的「─」引导符号一并去掉 —— 真机上看着像「- 」，多余。*/
         if (lfn && lfn[0])
-            w = cjk_puts_ucs2(MENU_NAME, 6, lfn);   /* 中文全名 */
+            w = cjk_puts_ucs2(MENU_NAME, 3, lfn);   /* 中文全名 */
         if (!w && shortname) {
             /* 没有长名（或字库不在，一个都画不出来）：退回 8.3 短名，
              * 但把非 ASCII 字节换成空格 —— 中文名生成的短名常含 0x81 之类，
@@ -590,7 +667,7 @@ void screen_menu(uint8_t has_last, const uint16_t *lfn, const char *shortname,
                 i++;
             }
             clean[i] = 0;
-            print_at(MENU_NAME, 6, clean);
+            print_at(MENU_NAME, 3, clean);
         }
     }
 

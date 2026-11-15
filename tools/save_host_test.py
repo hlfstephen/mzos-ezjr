@@ -359,6 +359,11 @@ STUB = r'''
 #include <stdint.h>
 #include "fat.h"
 
+/* g_sav_adopt / g_sav_size 现在定义在 fatn.c（v0.16.6 起 save.c 编进 bank3，
+ * 常驻段要引用它俩，只能由常驻模块持有）——这里只声明，不要再定义一遍。*/
+extern char     g_sav_adopt[13];
+extern uint32_t g_sav_size;
+
 #define IMG_BYTES ((size_t)TOTAL_SEC_ * 512)
 static uint8_t *g_img;
 static unsigned long g_writes;
@@ -440,6 +445,63 @@ int main(int argc, char **argv) {
         printf("WROTE %lu\n", g_writes);
         return 0;
     }
+    if (!strcmp(argv[1], "writeforeign")) {
+        /* 模拟「从电脑拷回 SAVER/ 的档」：文件名（长名）被改过，系统按新名字
+         * 现生成短名 SLZ2~1.SAV，跟本内核按 sav_ident() 算的哈希短名
+         * （S1xxxxxx.SAV）对不上 —— 读档只能靠长名。档始终在 SAVER/ 里。*/
+        bytes = (uint32_t)strtoul(argc > 3 ? argv[3] : "8192", 0, 10);
+        e = fat_open_sav(&ff, "SLZ2~1", bytes, g_lfn);
+        if (e) { printf("OPEN_ERR %u\n", (unsigned)e); return 0; }
+        n = bytes >> 9;
+        for (i = 0; i < n; i++) {
+            uint8_t buf[512];
+            unsigned j;
+            for (j = 0; j < 512; j++)
+                buf[j] = (uint8_t)((i * 7 + j) ^ (i >> 3));
+            e = fat_write_sec(&ff, buf);
+            if (e) { printf("WRITE_ERR %u\n", (unsigned)e); return 0; }
+        }
+        wr_img(argv[2]);
+            printf("WROTE %lu\n", g_writes);
+        return 0;
+    }
+    if (!strcmp(argv[1], "fill")) {
+        /* 先往 SAVER 里塞一堆别的存档，把后面那个「外来档」挤到目录后半段。
+         * 每个填充档 = 1 条 LFN + 1 条短名 = 2 个目录项，32 个就是 64 项：
+         *   FAT16(SPC=4) 一簇 128 项 —— 目标档落在第 5 个扇区；
+         *   FAT32(SPC=1) 一簇 16 项 —— 目标档落在第 5 簇。
+         * 两者都越过「只扫前 4 个扇区」的老实现。*/
+        unsigned cnt = (unsigned)strtoul(argc > 3 ? argv[3] : "32", 0, 10);
+        char nm[13];
+        uint16_t lf[8];
+        for (i = 0; i < cnt; i++) {
+            uint8_t buf[512];
+            unsigned j;
+            sprintf(nm, "FILL%02u", i);
+            lf[0] = 0x586B; lf[1] = 0x5145; lf[2] = 0x6863;   /* 填 充 */
+            lf[3] = (uint16_t)('0' + (i / 10));
+            lf[4] = (uint16_t)('0' + (i % 10));
+            lf[5] = 0;
+            e = fat_open_sav(&ff, nm, 512, lf);
+            if (e) { printf("FILL_ERR %u at %u\n", (unsigned)e, i); return 0; }
+            for (j = 0; j < 512; j++) buf[j] = (uint8_t)(i + j);
+            e = fat_write_sec(&ff, buf);
+            if (e) { printf("FILL_WERR %u at %u\n", (unsigned)e, i); return 0; }
+        }
+        wr_img(argv[2]);
+        printf("FILLED %u\n", cnt);
+        return 0;
+    }
+    if (!strcmp(argv[1], "findlfn") || !strcmp(argv[1], "findother")) {
+        unsigned j;
+        for (j = 0; j < 18; j++) g_lfn_buf[j] = g_lfn[j];    /* 含结尾的 0 */
+        if (!strcmp(argv[1], "findother"))
+            g_lfn_buf[7] = 0x6C35;          /* 换掉一个字：不该认出来 */
+        e = fat_find_sav_lfn(&ff);
+        printf("FIND %u %s %lu\n", (unsigned)e, g_sav_adopt,
+               (unsigned long)g_sav_size);
+        return 0;
+    }
     if (!strcmp(argv[1], "del")) {
         e = fat_delete(argc > 3 ? argv[3] : "POKEMON.SAV");
         printf("DEL %u\n", (unsigned)e);
@@ -489,7 +551,8 @@ def run(op, img_path, arg=""):
                                .replace("__LFNLONG__", "\n".join(lines)))
     exe = os.path.join(tmp, "t")
     r = subprocess.run(["gcc", "-O1", "-I" + SRC, stub,
-                        os.path.join(SRC, "fat.c"), os.path.join(SRC, "fatw.c"), os.path.join(SRC, "fatx.c"),
+                        os.path.join(SRC, "fat.c"), os.path.join(SRC, "fatw.c"),
+                        os.path.join(SRC, "fatx.c"), os.path.join(SRC, "fatn.c"),
                         "-o", exe], capture_output=True, text=True)
     if r.returncode != 0:
         print("  gcc 失败:\n" + r.stderr)
@@ -669,6 +732,19 @@ def lfn_case(title, fat32):
         print(f"  FAIL 新建 8KB：{out} size={f['size'] if f else None}")
         return False
 
+    # --- 1b. 闭环：用**固件的查找路径**把刚写进去的长名认回来 ---
+    #     这一条对应真机上的「备份写完立刻回读校验」（save_verify → sav_open
+    #     → fat_find_sav_lfn）。v0.16.12 只按长名读档，这条路一旦和写入侧
+    #     不一致，真机表现就是「备份失败/校验失败」+「存档读不出来」。
+    out = run("findlfn", img_path)
+    parts = out.split()
+    if len(parts) >= 4 and parts[0] == "FIND" and parts[1] == "0" \
+            and parts[2] == "POKEMON.SAV" and parts[3] == "8192":
+        print("  OK   写完立刻按长名找回来（短名/大小都对）")
+    else:
+        print(f"  FAIL 按长名找不回来：{out}")
+        ok = False
+
     # --- 2. LFN 项结构（独立解析器核对）---
     lf = parse_lfn(img, geo, name11)
     want_sum = lfn_checksum(name11)
@@ -779,6 +855,219 @@ def long_case(title, fat32):
     return ok
 
 
+
+def find_case(title, fat32):
+    """按长名认存档：从电脑拷回 SAVER/ 的 .sav（短名是系统现生成的）也该读得到。"""
+    ok = True
+    print(f"\n== {title} ==")
+    tmp = tempfile.mkdtemp(prefix="ezjr-img-")
+    img_path = os.path.join(tmp, "card.img")
+    geo = build_image(img_path, fat32)
+
+    # --- 1. 造一份「外来」存档：短名 SLZ2~1.SAV，长名 = ROM 长名换 .sav ---
+    out = run("writeforeign", img_path, "8192")
+    img = open(img_path, "rb").read()
+    if not out.startswith("WROTE"):
+        print(f"  FAIL 造外来存档：{out}")
+        return False
+    lfn = parse_lfn(img, geo, b"SLZ2~1  SAV")
+    if lfn and "".join(chr(c) for c in lfn["name"]).endswith(".sav"):
+        print(f"  OK   卡上有 SLZ2~1.SAV，长名 = 「{''.join(chr(c) for c in lfn['name'])}」")
+    else:
+        print(f"  FAIL 长名不对：{lfn}")
+        return False
+
+    # --- 2. sav_ident 的哈希短名找不到它（这就是真机上的现象）---
+    #      S1 开头的名字不存在，只在解释器里确认一下，避免误判成「本来就能找到」
+    if has_entry(img, geo, None, b"SLZ2~1  SAV"):
+        print("  OK   短名就是 SLZ2~1.SAV（不是 sav_ident 的哈希名）")
+
+    # --- 3. 按长名找：必须命中，并把短名记下来 ---
+    out = run("findlfn", img_path)
+    if out == "FIND 0 SLZ2~1.SAV 8192":
+        print("  OK   按长名认出来了：adopt = SLZ2~1.SAV（备份写回同一文件），"
+              "大小 8192（调用方按它验档）")
+    else:
+        print(f"  FAIL 按长名没认出来：{out}")
+        ok = False
+
+    # --- 4. 名字差一个字：不能认 ---
+    out = run("findother", img_path)
+    if out.startswith("FIND 4"):
+        print("  OK   名字差一个字就不认（返回 FAT_ERR_NO_FS）")
+    else:
+        print(f"  FAIL 认错了：{out}")
+        ok = False
+    return ok
+
+
+def upcase_sav_ext(img, geo):
+    """把 SAVER 里所有 .sav 长名的扩展名改成大写 .SAV（Windows 上很常见）。
+    返回是否改过。用来验证「按长名认档」不区分 ASCII 大小写。"""
+    sv = find_dir(img, geo, SAVER11)
+    if not sv:
+        return False
+    hit = False
+    for s in dir_sectors(img, geo, sv):
+        for i in range(0, SEC, 32):
+            p = s * SEC + i
+            if img[p] == 0:
+                return hit
+            if (img[p + 11] & 0x3F) != 0x0F:
+                continue
+            ch = [(p + o, struct.unpack_from("<H", img, p + o)[0])
+                  for o in LFN_SLOTS]
+            for k in range(len(ch) - 3):
+                if [c for _, c in ch[k:k + 4]] == [ord('.'), ord('s'),
+                                                   ord('a'), ord('v')]:
+                    for d, c in zip(range(1, 4), "SAV"):
+                        struct.pack_into("<H", img, ch[k + d][0], ord(c))
+                    hit = True
+    return hit
+
+
+def crowd_case(title, fat32):
+    """SAVER 里已有几十个档时，后面那个外来档还能不能认出来。
+
+    真机上 SAVER 会慢慢攒到十几个、几十个文件；只扫目录前 4 个扇区的话，
+    排在后面的档永远找不到，而屏幕上没有任何提示 —— 玩家只看到「存档没了」。"""
+    ok = True
+    print(f"\n== {title} ==")
+    tmp = tempfile.mkdtemp(prefix="ezjr-img-")
+    img_path = os.path.join(tmp, "card.img")
+    geo = build_image(img_path, fat32)
+
+    out = run("fill", img_path, "32")
+    if not out.startswith("FILLED"):
+        print(f"  FAIL 先塞 32 个填充档：{out}")
+        return False
+    print("  OK   SAVER 里先放了 32 个别的档（64 个目录项）")
+
+    out = run("writeforeign", img_path, "8192")
+    if not out.startswith("WROTE"):
+        print(f"  FAIL 再造外来档：{out}")
+        return False
+    img = open(img_path, "rb").read()
+    dsecs = dir_sectors(img, geo, find_dir(img, geo, SAVER11))
+    # 目标档的短名项落在第几个扇区 —— 就是老实现扫不到的位置
+    where = None
+    for n, s in enumerate(dsecs):
+        for i in range(0, SEC, 32):
+            p = s * SEC + i
+            if img[p:p + 11] == b"SLZ2~1  SAV":
+                where = n
+    if where is not None and where >= 4:
+        print(f"  OK   外来档排在第 {where + 1} 个扇区（老实现只扫前 4 个）")
+    else:
+        print(f"  FAIL 没把外来档放到目录后半段：扇区 {where}")
+        return False
+
+    out = run("findlfn", img_path)
+    if out == "FIND 0 SLZ2~1.SAV 8192":
+        print("  OK   排在第 %d 个扇区也认出来了" % (where + 1))
+    else:
+        print(f"  FAIL 目录一长就找不到：{out}")
+        ok = False
+    return ok
+
+
+def upper_case(title, fat32):
+    """卡上长名的扩展名是大写 .SAV（Windows / 部分模拟器的写法）也得认。"""
+    ok = True
+    print(f"\n== {title} ==")
+    tmp = tempfile.mkdtemp(prefix="ezjr-img-")
+    img_path = os.path.join(tmp, "card.img")
+    geo = build_image(img_path, fat32)
+
+    out = run("writeforeign", img_path, "8192")
+    if not out.startswith("WROTE"):
+        print(f"  FAIL 造外来档：{out}")
+        return False
+
+    img = bytearray(open(img_path, "rb").read())
+    if not upcase_sav_ext(img, geo):
+        print("  FAIL 没找到 .sav 的长名项，改不了大小写")
+        return False
+    open(img_path, "wb").write(img)
+    print("  OK   把卡上长名的扩展名改成大写「.SAV」")
+
+    out = run("findlfn", img_path)
+    if out == "FIND 0 SLZ2~1.SAV 8192":
+        print("  OK   扩展名大写也认出来了")
+    else:
+        print(f"  FAIL 大写扩展名认不出：{out}")
+        ok = False
+    return ok
+
+
+def move_entry_with_lfn(img, geo, name11):
+    """把 SAVER 里某个文件连同它前面的长名项一起搬到根目录。
+    用于负向用例：存档不在 SAVER/ 时，内核应该认不出（只找这一处）。"""
+    assert isinstance(img, bytearray)
+    sv = find_dir(img, geo, SAVER11)
+    if not sv:
+        return False
+    src = []                       # 从长名项第一条到短名项
+    for s in dir_sectors(img, geo, sv):
+        for i in range(0, SEC, 32):
+            p = s * SEC + i
+            e = img[p:p + 32]
+            if e[0] == 0:
+                break
+            if e[0] == 0xE5:
+                src = []
+                continue
+            if (e[11] & 0x3F) == 0x0F:
+                src.append((p, bytes(e)))
+                continue
+            if e[0:11] == name11:
+                src.append((p, bytes(e)))
+                for s2 in dir_sectors(img, geo, None):
+                    for i2 in range(0, SEC, 32):
+                        if img[s2 * SEC + i2] in (0x00, 0xE5):
+                            if i2 + 32 * len(src) > SEC:
+                                return False    # 别跨扇区，测试用不着
+                            for n, (p0, raw) in enumerate(src):
+                                img[s2 * SEC + i2 + n * 32:
+                                    s2 * SEC + i2 + n * 32 + 32] = raw
+                                img[p0] = 0xE5
+                            return True
+                return False
+            src = []
+    return False
+
+
+def only_saver_case(title, fat32):
+    """存档只在 SAVER/ 认：不在 SAVER/ 的那份必须认不出（负向守门）。
+
+    v0.16.11 曾按「模拟器默认把 .sav 放在 ROM 旁边」的假设加了 ROM 所在目录
+    兜底，v0.16.14 已撤回 —— 真机上存档永远拷回 SAVER/，去别的目录认档只会
+    认错文件。这一组把档搬到根目录，断言**读不到**，防止那条兜底被加回来。"""
+    print(f"\n== {title} ==")
+    tmp = tempfile.mkdtemp(prefix="ezjr-img-")
+    img_path = os.path.join(tmp, "card.img")
+    geo = build_image(img_path, fat32)
+
+    out = run("writeforeign", img_path, "8192")
+    if not out.startswith("WROTE"):
+        print(f"  FAIL 造外来档：{out}")
+        return False
+
+    img = bytearray(open(img_path, "rb").read())
+    if not move_entry_with_lfn(img, geo, b"SLZ2~1  SAV"):
+        print("  FAIL 没能把存档连同长名项搬到根目录")
+        return False
+    open(img_path, "wb").write(img)
+    print("  OK   存档连同长名项搬到根目录（不在 SAVER/ 里）")
+
+    out = run("findlfn", img_path)
+    if out.startswith("FIND 4"):
+        print("  OK   不在 SAVER/ 就不认（返回 FAT_ERR_NO_FS）")
+        return True
+    print(f"  FAIL 又去 SAVER/ 以外的地方认档了：{out}")
+    return False
+
+
 def main():
     print("save_host_test — 存档写路径（真 fat.c + 真 fatw.c，独立 Python 解析器核对）")
     a = case("FAT16 · 4KB 簇", False)
@@ -787,7 +1076,14 @@ def main():
     d = lfn_case("FAT32 · 512B 簇", True)
     e = long_case("FAT16 · 4KB 簇", False)
     f_ = long_case("FAT32 · 512B 簇", True)
-    allok = a and b and c and d and e and f_
+    g = find_case("按长名认存档 · FAT16", False)
+    h = find_case("按长名认存档 · FAT32", True)
+    i = crowd_case("目录里几十个档，外来档排在后面 · FAT16", False)
+    j = crowd_case("目录里几十个档，外来档排在后面 · FAT32", True)
+    k = upper_case("长名扩展名大写 .SAV · FAT16", False)
+    l = only_saver_case("存档只在 SAVER/ 认（不在 SAVER/ 的档不认） · FAT16", False)
+    allok = (a and b and c and d and e and f_ and g and h and i and j and k
+             and l)
     print("\n" + ("全部通过" if allok else "有失败项"))
     return 0 if allok else 1
 
